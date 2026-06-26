@@ -363,6 +363,7 @@ def load_and_process(file_bytes: bytes, filename: str, rapid_days: int):
                 "visit_1": rapid_df["_prev_date"].dt.strftime("%Y-%m-%d").tolist(),
                 "visit_2": rapid_df["visit_date"].dt.strftime("%Y-%m-%d").tolist(),
                 "days_apart": rapid_df["_days_diff"].astype(int).tolist(),
+                "voucher_id": rapid_df["voucher_id"].astype(str).tolist() if "voucher_id" in rapid_df.columns else [""] * len(rapid_df),
             }
             if dcol and dcol in rapid_df.columns:
                 rapid_dict["doctor"] = rapid_df[dcol].astype(str).tolist()
@@ -2428,7 +2429,7 @@ with st.sidebar:
 
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🗑️ Clear Data Lake", use_container_width=True, type="secondary"):
-            for k in ["data_lake","dp_result","dp_map_used","raw_bytes","raw_filename"]:
+            for k in ["data_lake","dp_result","dp_map_used","raw_bytes","raw_filename", "verifications"]:
                 st.session_state.pop(k, None)
             st.rerun()
     else:
@@ -2468,7 +2469,7 @@ if uploaded is not None:
         st.session_state["raw_filename"] = _new_name
         # New file → clear data lake so user re-runs Data Prep
         for _k in ["data_lake", "dp_result", "dp_map_used", "normalised_df",
-                   "normalised_col", "normalised_map", "ann_df", "ann_detected"]:
+                   "normalised_col", "normalised_map", "ann_df", "ann_detected", "verifications"]:
             st.session_state.pop(_k, None)
         st.rerun()
     elif "raw_bytes" not in st.session_state:
@@ -2568,15 +2569,15 @@ def _render_tab_locked(tab_name: str = ""):
 </div>""", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-(tab_dataprep, tab_summary, tab_records, tab_repeat,
- tab_network, tab_xfac, tab_cv) = st.tabs([
+(tab_dataprep, tab_cv, tab_summary, tab_records, tab_repeat,
+ tab_network, tab_xfac) = st.tabs([
     "🗂️ Data Prep",
+    "📄 Counter-Verification",
     "📊 Summary",
     "📋 All Records",
     f"🔁 Repeat Patients  {'🟡' if repeat_groups or rapid else '🟢'}  {len(repeat_groups)}",
     "🕸️ Network Graph",
     "🏥 Ghost Prescription Tracker",
-    "📄 Counter-Verification",
 ])
 
 # ══ SUMMARY ══════════════════════════════════════════════════════════════════
@@ -2936,10 +2937,28 @@ with tab_repeat:
             # Full table
             with st.expander("📋 Full rapid revisit table", expanded=False):
                 _rv_df = pd.DataFrame(_rapid_filtered)
+                if not _rv_df.empty:
+                    _rv_df["Pushed"] = _rv_df["voucher_id"].apply(lambda x: "✅" if x in st.session_state["verifications"] else "❌")
                 st.dataframe(_rv_df, use_container_width=True, height=400)
 
             # Download
             _rv_dl = pd.DataFrame(_rapid_filtered).to_csv(index=False).encode()
+
+        if st.button("🚀 Push to Verification Dashboard", key="push_rapid"):
+            pushed_count = 0
+            for r in _rapid_filtered:
+                vid = r.get("voucher_id")
+                if vid and vid not in st.session_state["verifications"]:
+                    st.session_state["verifications"][vid] = {
+                        "status": "Pending",
+                        "deduction": 0.0,
+                        "reason": "Flagged for rapid revisit review"
+                    }
+                    pushed_count += 1
+            if pushed_count > 0:
+                st.success(f"✅ Pushed {pushed_count} cases to Verification Dashboard!")
+            else:
+                st.info("ℹ️ All cases already in Verification Dashboard.")
             st.download_button(
                 "⬇️ Download rapid revisit list",
                 data=_rv_dl,
@@ -3431,6 +3450,22 @@ with tab_xfac:
   </div>
 </div>""", unsafe_allow_html=True)
 
+    if st.button("🚀 Push Potential Ghost Prescriptions to Verification Dashboard", key="push_ghost"):
+        pushed_count = 0
+        for _, row in no_rec.iterrows():
+            vid = str(row["ph_voucher"])
+            if vid and vid not in st.session_state["verifications"]:
+                st.session_state["verifications"][vid] = {
+                    "status": "Pending",
+                    "deduction": 0.0,
+                    "reason": "Flagged as Potential Ghost Prescription (No Hospital Visit)"
+                }
+                pushed_count += 1
+        if pushed_count > 0:
+            st.success(f"✅ Pushed {pushed_count} potential ghost prescriptions to Verification Dashboard!")
+        else:
+            st.info("ℹ️ All cases already in Verification Dashboard.")
+
     if not no_rec.empty:
         # Sub-controls
         t1c1, t1c2, t1c3 = st.columns([2,1.5,1.5])
@@ -3460,9 +3495,10 @@ with tab_xfac:
             "ph_voucher","ph_patient","ph_rama","ph_date",
             "ph_ins","ph_total","ph_doctor","ph_dept"
         ]].copy()
+        t1_show["Pushed"] = t1_show["ph_voucher"].astype(str).apply(lambda x: "✅" if x in st.session_state["verifications"] else "❌")
         t1_show.columns = [
             "Pharmacy Voucher","Patient Name","RAMA Number","Dispensing Date",
-            "Insurance Claim (RWF)","Total Cost (RWF)","Prescriber","Specialty"
+            "Insurance Claim (RWF)","Total Cost (RWF)","Prescriber","Specialty", "Pushed"
         ]
         t1_show["Dispensing Date"] = pd.to_datetime(
             t1_show["Dispensing Date"], errors="coerce"
@@ -3744,6 +3780,9 @@ with tab_cv:
     st.markdown('<div class="sec-head">📄 Interactive Counter-Verification Dashboard</div>',
                 unsafe_allow_html=True)
 
+    total_deds = sum(v.get("deduction", 0) for v in st.session_state["verifications"].values())
+    st.metric("Total Current Deductions", f"{total_deds:,.0f} RWF")
+
     # ── Sidebar-like controls inside the tab ──
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
@@ -3794,6 +3833,9 @@ with tab_cv:
             cv_df = cv_df[cv_df["voucher_id"].apply(get_status) == status_filter]
 
     # ── Render Cards ──
+    if st.button("🗑️ Clear All Verifications", type="secondary"):
+        st.session_state["verifications"] = {}
+        st.rerun()
     st.markdown(f"Showing **{len(cv_df)}** records")
 
     # Pagination (simple)

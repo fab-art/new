@@ -4110,7 +4110,7 @@ with tab_dataprep:
             _qual_rows.append({
                 "Column": str(_c)[:40],
                 "Type": str(_s_col.dtype),
-                "Fill %": f"{100-_null_pct:.0f}%",
+                "Fill_Pct": f"{100-_null_pct:.0f}%",
                 "Unique": _uniq,
                 "Sample values": _samples,
             })
@@ -4124,9 +4124,12 @@ with tab_dataprep:
                 return "color:#ef4444;font-weight:bold"
             except Exception:
                 return ""
+        if _qual_df.empty:
+            st.warning("No columns detected in the uploaded file.")
+            st.stop()
 
         st.dataframe(
-            _qual_df.style.map(_color_fill, subset=["Fill %"]),
+            _qual_df.style.map(_color_fill, subset=["Fill_Pct"]),
             use_container_width=True, height=280,
         )
 

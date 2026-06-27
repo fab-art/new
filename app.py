@@ -2531,6 +2531,13 @@ def generate_rssb_final_xlsx(
     ins_col  = "insurance_copay" if "insurance_copay" in df.columns else None
     med_col  = "medicine_cost" if "medicine_cost" in df.columns else None
 
+    # Reproduce the same duplicate-paper-code disambiguation used when the
+    # decisions dict was built in the Verification Cards tab, so each row
+    # matches its own decision even if paper codes repeat in the source file.
+    _pc_raw = df[vid_col].astype(str).str.strip()
+    _dupe_suffix = _pc_raw.groupby(_pc_raw).cumcount()
+    _pc_keys = _pc_raw.where(_dupe_suffix == 0, _pc_raw + "__" + _dupe_suffix.astype(str))
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Sheet1"
@@ -2556,8 +2563,9 @@ def generate_rssb_final_xlsx(
     ri = 2
     n_deducted = 0
     total_100 = total_85 = total_diff = 0.0
-    for _, row in df.iterrows():
-        pc = str(row.get(vid_col, "")).strip()
+    for pos, (_, row) in enumerate(df.iterrows()):
+        pc_display = str(row.get(vid_col, "")).strip()
+        pc = _pc_keys.iloc[pos]
         dec = decisions.get(pc, {})
         status = dec.get("status", "Verified")
         deduction = float(dec.get("deduction", 0) or 0)
@@ -2581,7 +2589,7 @@ def generate_rssb_final_xlsx(
         total_diff += diff
 
         vals = [
-            pc,
+            pc_display,
             row.get(date_col) if date_col else "",
             str(row.get(pnm_col, "")) if pnm_col else "",
             str(row.get(rama_col, "")) if rama_col else "",
@@ -3029,7 +3037,15 @@ with tab_verify:
         hide_reviewed = st.checkbox("Hide reviewed", value=False, key="vc_hide_reviewed")
 
     work = df.copy()
-    work["_pc"] = work[vid_col].astype(str).str.strip()
+    work["_pc_display"] = work[vid_col].astype(str).str.strip()
+    # Disambiguate duplicate paper codes (re-issued vouchers, data-entry
+    # duplicates) so each row gets a unique decision key — the original
+    # code is kept in _pc_display for the draft sheet, report, and matching
+    # against ghost/high-cost voucher sets.
+    _dupe_suffix = work.groupby("_pc_display").cumcount()
+    work["_pc"] = work["_pc_display"].where(
+        _dupe_suffix == 0, work["_pc_display"] + "__" + _dupe_suffix.astype(str)
+    )
     cost_col = "amount" if "amount" in work.columns else (
         "medicine_cost" if "medicine_cost" in work.columns else None)
     if cost_col:
@@ -3041,9 +3057,9 @@ with tab_verify:
         if not ghost_vouchers:
             st.info("👉 Run **Cross-Facility Match** first (upload hospital/clinic files there) "
                      "to populate this queue.")
-        queue_df = work[work["_pc"].isin(ghost_vouchers)].copy()
+        queue_df = work[work["_pc_display"].isin(ghost_vouchers)].copy()
     elif queue_choice.startswith("🟠"):
-        queue_df = work[work["_pc"].isin(high_cost_vouchers)].copy()
+        queue_df = work[work["_pc_display"].isin(high_cost_vouchers)].copy()
     elif queue_choice.startswith("🟣"):
         queue_df = (work[work[repeat_id_col].astype(str).isin(repeat_patient_ids)].copy()
                     if repeat_id_col in work.columns else work.iloc[0:0])
@@ -3113,8 +3129,11 @@ with tab_verify:
                 if is_active: row_cls += " vcd-listrow-active"
                 elif is_done: row_cls += " vcd-listrow-done"
                 check = "✅ " if is_done else ""
+                # Key on the row's positional index (always unique within the
+                # queue), not the paper code — paper codes can repeat in real
+                # voucher data (re-issued vouchers, data-entry duplicates).
                 if st.button(f"{check}{nm}  ·  RWF {row['_amt']:,.0f}",
-                             key=f"vc_jump_{pc}", use_container_width=True,
+                             key=f"vc_jump_{i}", use_container_width=True,
                              type="primary" if is_active else "secondary"):
                     st.session_state["vc_active_idx"] = i
                     st.rerun()
@@ -3123,6 +3142,7 @@ with tab_verify:
     with col_card:
         row = queue_df.iloc[active_idx]
         pc = row["_pc"]
+        pc_display = row["_pc_display"]
         existing = vc_decisions.get(pc, {})
 
         pnm_col  = "patient_name"   if "patient_name"   in df.columns else None
@@ -3148,10 +3168,10 @@ with tab_verify:
         facility = str(row.get(fac_col, "")) if fac_col and pd.notna(row.get(fac_col)) else ""
 
         tag, tag_cls = "", ""
-        if pc in ghost_vouchers:
+        if pc_display in ghost_vouchers:
             tag, tag_cls = "👻 No facility record found", "vcd-tag-ghost"
-        elif pc in high_cost_vouchers:
-            tag, tag_cls = high_cost_reason_map.get(pc, "High cost / high frequency"), "vcd-tag-highcost"
+        elif pc_display in high_cost_vouchers:
+            tag, tag_cls = high_cost_reason_map.get(pc_display, "High cost / high frequency"), "vcd-tag-highcost"
         elif str(row.get(repeat_id_col, "")) in repeat_patient_ids:
             tag, tag_cls = "🔁 Patient has multiple visits this period", "vcd-tag-repeat"
 
@@ -3159,7 +3179,7 @@ with tab_verify:
         st.markdown(f"""
 <div class='vcd-topbar'>
   <div>
-    <span class='vcd-name'>{name}</span><span class='vcd-pc'>#{pc}</span>
+    <span class='vcd-name'>{name}</span><span class='vcd-pc'>#{pc_display}</span>
     <div class='vcd-sub'>Card {active_idx + 1} of {len(queue_df)}{"  ·  " + tag if tag else ""}</div>
   </div>
   <div>{f"<span class='vcd-badge {tag_cls}'>{tag}</span>" if tag else "<span class='vcd-badge'>Verified</span>"}</div>
@@ -3242,8 +3262,8 @@ with tab_verify:
 
         # ── Verification controls ──────────────────────────────────────────────
         st.markdown('<div class="sec-head">✍️ Verification</div>', unsafe_allow_html=True)
-        default_status = existing.get("status", "Ghost Prescription" if pc in ghost_vouchers else
-                                       "Signature Mismatch" if (pc in high_cost_vouchers or
+        default_status = existing.get("status", "Ghost Prescription" if pc_display in ghost_vouchers else
+                                       "Signature Mismatch" if (pc_display in high_cost_vouchers or
                                        str(row.get(repeat_id_col, "")) in repeat_patient_ids) else "Verified")
         default_ded = existing.get("deduction", 0.0)
         default_reason = existing.get("reason", "")
@@ -3262,7 +3282,7 @@ with tab_verify:
 
         if status != "Verified" or deduction > 0 or reason.strip():
             vc_decisions[pc] = {"status": status, "deduction": deduction, "reason": reason,
-                                 "patient": name, "rama": rama}
+                                 "patient": name, "rama": rama, "paper_code": pc_display}
         elif pc in vc_decisions:
             del vc_decisions[pc]
         st.session_state["vc_decisions"] = vc_decisions
@@ -3292,7 +3312,7 @@ with tab_verify:
                  "and it will appear here automatically.")
     else:
         draft_rows = [{
-            "Paper Code": pc, "Patient": d.get("patient", ""), "RAMA": d.get("rama", ""),
+            "Paper Code": d.get("paper_code", pc), "Patient": d.get("patient", ""), "RAMA": d.get("rama", ""),
             "Status": d.get("status", ""), "Deduction (RWF)": d.get("deduction", 0),
             "Reason": d.get("reason", ""),
         } for pc, d in vc_decisions.items()]

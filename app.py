@@ -2392,6 +2392,26 @@ def _vc_id_col(df_: pd.DataFrame) -> str | None:
     return None
 
 
+def patient_period_stats(df: pd.DataFrame, rama_value: str) -> dict:
+    """
+    Aggregate stats for one patient (RAMA number) across the currently
+    loaded period — visit count, amount consumed, average per voucher.
+    Mirrors the 'Patient visits in three months' style block, scoped to
+    whatever period is actually loaded (we don't fabricate a fixed window).
+    """
+    out = {"visits": 0, "amount_consumed": 0.0, "avg_per_voucher": 0.0}
+    if "patient_id" not in df.columns or not rama_value:
+        return out
+    sub = df[df["patient_id"].astype(str).str.strip() == str(rama_value).strip()]
+    out["visits"] = len(sub)
+    cost_col = "amount" if "amount" in df.columns else None
+    if cost_col and len(sub):
+        amt = pd.to_numeric(sub[cost_col], errors="coerce").fillna(0)
+        out["amount_consumed"] = float(amt.sum())
+        out["avg_per_voucher"] = float(amt.mean())
+    return out
+
+
 def build_high_cost_queue(df: pd.DataFrame, cost_percentile: float = 0.9,
                            min_practitioner_repeats: int = 3) -> pd.DataFrame:
     """
@@ -2936,34 +2956,39 @@ with tab_verify:
   else:
     st.markdown("""
 <style>
-.vc-card{background:#111720;border:1px solid #1e2a38;border-radius:12px;
-         padding:16px 18px;margin-bottom:14px;transition:border-color .15s}
-.vc-card:hover{border-color:#2d3f54}
-.vc-card-ghost{border-left:3px solid #ef4444}
-.vc-card-highcost{border-left:3px solid #f59e0b}
-.vc-card-repeat{border-left:3px solid #a78bfa}
-.vc-card-clean{border-left:3px solid #1e2a38}
-.vc-row{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px}
-.vc-name{font-size:14px;font-weight:700;color:#e2e8f0;font-family:Syne,sans-serif}
-.vc-pc{font-size:11px;color:#475569;font-family:monospace}
-.vc-cost{font-size:18px;font-weight:800;color:#00e5a0;font-family:Syne,sans-serif}
-.vc-meta{font-size:11px;color:#64748b;font-family:monospace;margin-top:2px}
-.vc-tag{display:inline-block;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);
-        color:#fca5a5;border-radius:5px;padding:1px 8px;font-size:10px;font-family:monospace;
-        margin-top:6px}
+.vcd-topbar{display:flex;justify-content:space-between;align-items:flex-start;
+            margin-bottom:14px}
+.vcd-name{font-size:19px;font-weight:800;color:#e2e8f0;font-family:Syne,sans-serif}
+.vcd-pc{font-size:12px;color:#64748b;font-family:monospace;margin-left:8px}
+.vcd-sub{font-size:12px;color:#475569;font-family:monospace;margin-top:2px}
+.vcd-section{background:#111720;border:1px solid #1e2a38;border-radius:10px;
+             padding:12px 16px;margin-bottom:10px}
+.vcd-row{display:flex;justify-content:space-between;align-items:center}
+.vcd-row + .vcd-row{margin-top:8px;padding-top:8px;border-top:1px solid #1e2a38}
+.vcd-label{font-size:12px;color:#64748b;font-family:monospace}
+.vcd-value{font-size:13px;color:#e2e8f0;font-weight:600;text-align:right}
+.vcd-badge{display:inline-block;background:rgba(14,165,233,.1);border:1px solid rgba(14,165,233,.25);
+           color:#7dd3fc;border-radius:5px;padding:2px 9px;font-size:11px;font-family:monospace}
+.vcd-tag-ghost{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);color:#fca5a5}
+.vcd-tag-highcost{background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.3);color:#fcd34d}
+.vcd-tag-repeat{background:rgba(167,139,250,.12);border:1px solid rgba(167,139,250,.3);color:#c4b5fd}
+.vcd-metablock{display:flex;gap:18px}
+.vcd-metacol{flex:1}
+.vcd-listrow{display:flex;justify-content:space-between;padding:7px 10px;border-radius:7px;
+             font-size:12px;font-family:monospace;cursor:default;border:1px solid transparent}
+.vcd-listrow-active{background:rgba(0,229,160,.08);border-color:rgba(0,229,160,.3)}
+.vcd-listrow-done{opacity:.55}
 </style>""", unsafe_allow_html=True)
 
     st.markdown("""
 <div style='font-family:Syne,sans-serif;font-size:26px;font-weight:800;color:#e2e8f0;
      margin-bottom:4px'>🗳️ Verification Cards</div>
 <div style='color:#64748b;font-size:13px;margin-bottom:18px;font-family:monospace'>
-  Review each claim as a card — set status, deduction, and reason directly in the app.
-  No more download → edit in Excel → re-upload. Everything below feeds the
-  draft sheet and the final RSSB report automatically.
+  Review one claim at a time — set deduction and reason directly in the app, then move
+  to the next with the buttons below. Nothing leaves the browser until you export.
 </div>""", unsafe_allow_html=True)
 
-    # ── Persistent decision store ───────────────────────────────────────────
-    # Keyed by Paper Code / Voucher ID → {status, deduction, reason}
+    # ── Persistent decision store ────────────────────────────────────────────
     if "vc_decisions" not in st.session_state:
         st.session_state["vc_decisions"] = {}
     vc_decisions = st.session_state["vc_decisions"]
@@ -2977,21 +3002,22 @@ with tab_verify:
     STATUS_OPTIONS = ["Verified", "Deducted", "Ghost Prescription", "Signature Mismatch"]
 
     # ── Pull ghost-prescription results from Cross-Facility Match (if run) ───
-    _xfac_cache = st.session_state.get("xfac_last_result")  # set in Cross-Facility tab
+    _xfac_cache = st.session_state.get("xfac_last_result")
     ghost_vouchers = set()
     if _xfac_cache is not None and not _xfac_cache.empty:
         _ghost_df = _xfac_cache[_xfac_cache["status"] == "NO_RECORD"]
         ghost_vouchers = set(_ghost_df["ph_voucher"].astype(str).str.strip())
 
-    # ── Build the four queues ────────────────────────────────────────────────
     high_cost_df = build_high_cost_queue(df)
     high_cost_vouchers = set(high_cost_df[vid_col].astype(str).str.strip()) if vid_col in high_cost_df.columns and not high_cost_df.empty else set()
+    high_cost_reason_map = (dict(zip(high_cost_df[vid_col].astype(str).str.strip(), high_cost_df["_flag_reason"]))
+                             if not high_cost_df.empty else {})
 
     repeat_id_col = s.get("patient_col", "patient_id")
     repeat_patient_ids = {str(g.get(repeat_id_col, g.get("patient_id", ""))) for g in repeat_groups if g["visits"] >= 2}
 
-    # ── Queue selector ───────────────────────────────────────────────────────
-    qc1, qc2 = st.columns([3, 1])
+    # ── Queue selector + amount filter ───────────────────────────────────────
+    qc1, qc2 = st.columns([2, 1])
     with qc1:
         queue_choice = st.radio(
             "Queue",
@@ -3000,45 +3026,56 @@ with tab_verify:
             horizontal=True, label_visibility="collapsed", key="vc_queue",
         )
     with qc2:
-        cards_per_page = st.selectbox("Cards / page", [10, 20, 50], index=1, key="vc_per_page")
+        hide_reviewed = st.checkbox("Hide reviewed", value=False, key="vc_hide_reviewed")
 
-    # Build the working set for the selected queue
     work = df.copy()
     work["_pc"] = work[vid_col].astype(str).str.strip()
+    cost_col = "amount" if "amount" in work.columns else (
+        "medicine_cost" if "medicine_cost" in work.columns else None)
+    if cost_col:
+        work["_amt"] = pd.to_numeric(work[cost_col], errors="coerce").fillna(0)
+    else:
+        work["_amt"] = 0.0
 
     if queue_choice.startswith("🔴"):
         if not ghost_vouchers:
             st.info("👉 Run **Cross-Facility Match** first (upload hospital/clinic files there) "
-                     "to populate the Ghost Prescription queue. Showing nothing until then.")
-            queue_df = work.iloc[0:0]
-        else:
-            queue_df = work[work["_pc"].isin(ghost_vouchers)].copy()
-            queue_df["_default_status"] = "Ghost Prescription"
+                     "to populate this queue.")
+        queue_df = work[work["_pc"].isin(ghost_vouchers)].copy()
     elif queue_choice.startswith("🟠"):
         queue_df = work[work["_pc"].isin(high_cost_vouchers)].copy()
-        # attach flag reason for display
-        if not high_cost_df.empty:
-            _reason_map = dict(zip(high_cost_df[vid_col].astype(str).str.strip(),
-                                    high_cost_df["_flag_reason"]))
-            queue_df["_flag_reason"] = queue_df["_pc"].map(_reason_map).fillna("")
-        queue_df["_default_status"] = "Signature Mismatch"
     elif queue_choice.startswith("🟣"):
-        if repeat_id_col in work.columns:
-            queue_df = work[work[repeat_id_col].astype(str).isin(repeat_patient_ids)].copy()
-        else:
-            queue_df = work.iloc[0:0]
-        queue_df["_default_status"] = "Signature Mismatch"
+        queue_df = (work[work[repeat_id_col].astype(str).isin(repeat_patient_ids)].copy()
+                    if repeat_id_col in work.columns else work.iloc[0:0])
     else:
         queue_df = work.copy()
-        queue_df["_default_status"] = "Verified"
 
-    # Sort: most expensive first for review efficiency
-    sort_col = "medicine_cost" if "medicine_cost" in queue_df.columns else (
-        "amount" if "amount" in queue_df.columns else None)
-    if sort_col and not queue_df.empty:
-        queue_df = queue_df.sort_values(sort_col, ascending=False)
+    # ── Filter by amount ──────────────────────────────────────────────────────
+    if not queue_df.empty:
+        amt_min_data, amt_max_data = float(queue_df["_amt"].min()), float(queue_df["_amt"].max())
+        if amt_max_data <= amt_min_data:
+            amt_max_data = amt_min_data + 1.0
+        fa1, fa2 = st.columns(2)
+        with fa1:
+            amt_lo = st.number_input("Min amount (RWF)", min_value=0.0,
+                                      value=0.0, step=1000.0, key="vc_amt_lo")
+        with fa2:
+            amt_hi = st.number_input("Max amount (RWF)", min_value=0.0,
+                                      value=float(amt_max_data), step=1000.0, key="vc_amt_hi")
+        queue_df = queue_df[(queue_df["_amt"] >= amt_lo) & (queue_df["_amt"] <= amt_hi)]
 
-    # ── Queue summary strip ───────────────────────────────────────────────────
+    if hide_reviewed and not queue_df.empty:
+        queue_df = queue_df[~queue_df["_pc"].isin(vc_decisions.keys())]
+
+    vc_search = st.text_input("🔍 Filter list", key="vc_search",
+                               placeholder="Name, RAMA, paper code, practitioner…")
+    if vc_search and not queue_df.empty:
+        mask = queue_df.apply(lambda c: c.astype(str).str.contains(vc_search, case=False, na=False)).any(axis=1)
+        queue_df = queue_df[mask]
+
+    queue_df = queue_df.sort_values("_amt", ascending=False).reset_index(drop=True)
+
+    # ── Summary strip ─────────────────────────────────────────────────────────
     qm1, qm2, qm3, qm4 = st.columns(4)
     qm1.metric("Cards in queue", f"{len(queue_df):,}")
     n_reviewed = sum(1 for pc in queue_df["_pc"] if pc in vc_decisions) if not queue_df.empty else 0
@@ -3049,120 +3086,209 @@ with tab_verify:
 
     if queue_df.empty:
         st.success("✅ Nothing in this queue right now.")
-    else:
-        # ── Search / filter within queue ──────────────────────────────────
-        fc1, fc2 = st.columns([3, 1])
-        with fc1:
-            vc_search = st.text_input("🔍 Filter cards", key="vc_search",
-                                       placeholder="Name, RAMA, paper code, practitioner…")
-        with fc2:
-            hide_reviewed = st.checkbox("Hide reviewed", value=False, key="vc_hide_reviewed")
+        st.stop()
 
-        disp = queue_df.copy()
-        if vc_search:
-            mask = disp.apply(lambda c: c.astype(str).str.contains(vc_search, case=False, na=False)).any(axis=1)
-            disp = disp[mask]
-        if hide_reviewed:
-            disp = disp[~disp["_pc"].isin(vc_decisions.keys())]
+    # ── Active card index (clamped, reset when queue composition changes) ───
+    _queue_key = f"{queue_choice}|{len(queue_df)}|{amt_lo if not queue_df.empty else 0}"
+    if st.session_state.get("vc_active_queue_key") != _queue_key:
+        st.session_state["vc_active_queue_key"] = _queue_key
+        st.session_state["vc_active_idx"] = 0
+    active_idx = min(st.session_state.get("vc_active_idx", 0), len(queue_df) - 1)
+    active_idx = max(active_idx, 0)
 
-        total_pages = max(1, math.ceil(len(disp) / cards_per_page))
-        page = st.number_input("Page", 1, total_pages, 1, key="vc_page") if total_pages > 1 else 1
-        page_slice = disp.iloc[(page - 1) * cards_per_page : page * cards_per_page]
+    col_list, col_card = st.columns([1, 2.1])
 
-        st.markdown(f"<div style='font-size:11px;color:#64748b;font-family:monospace;margin:6px 0 14px'>"
-                    f"Showing {len(page_slice)} of {len(disp):,} cards in this queue "
-                    f"(page {page} of {total_pages})</div>", unsafe_allow_html=True)
+    # ── LEFT: list of cards to review ─────────────────────────────────────────
+    with col_list:
+        st.markdown('<div class="sec-head">📋 Cards to Review</div>', unsafe_allow_html=True)
+        pnm_col_l = "patient_name" if "patient_name" in df.columns else None
+        list_box = st.container(height=560)
+        with list_box:
+            for i, row in queue_df.iterrows():
+                pc = row["_pc"]
+                is_done = pc in vc_decisions
+                is_active = i == active_idx
+                nm = str(row.get(pnm_col_l, pc))[:22] if pnm_col_l else pc
+                row_cls = "vcd-listrow"
+                if is_active: row_cls += " vcd-listrow-active"
+                elif is_done: row_cls += " vcd-listrow-done"
+                check = "✅ " if is_done else ""
+                if st.button(f"{check}{nm}  ·  RWF {row['_amt']:,.0f}",
+                             key=f"vc_jump_{pc}", use_container_width=True,
+                             type="primary" if is_active else "secondary"):
+                    st.session_state["vc_active_idx"] = i
+                    st.rerun()
 
-        pnm_col = "patient_name" if "patient_name" in df.columns else None
-        rama_col = "patient_id" if "patient_id" in df.columns else None
-        doc_col = "doctor_name" if "doctor_name" in df.columns else None
-        date_col = "visit_date" if "visit_date" in df.columns else None
-        tot_col = "amount" if "amount" in df.columns else None
-        med_col = "medicine_cost" if "medicine_cost" in df.columns else None
+    # ── RIGHT: active card detail (screenshot-style layout) ───────────────────
+    with col_card:
+        row = queue_df.iloc[active_idx]
+        pc = row["_pc"]
+        existing = vc_decisions.get(pc, {})
 
-        for _, row in page_slice.iterrows():
-            pc = row["_pc"]
-            existing = vc_decisions.get(pc, {})
-            default_status = existing.get("status", row.get("_default_status", "Verified"))
-            default_ded = existing.get("deduction", 0.0)
-            default_reason = existing.get("reason", "")
+        pnm_col  = "patient_name"   if "patient_name"   in df.columns else None
+        rama_col = "patient_id"     if "patient_id"     in df.columns else None
+        doc_col  = "doctor_name"    if "doctor_name"    in df.columns else None
+        doctp_col= "doctor_type"    if "doctor_type"    in df.columns else None
+        date_col = "visit_date"     if "visit_date"     in df.columns else None
+        fac_col  = "facility"       if "facility"       in df.columns else None
+        tot_col  = "amount"         if "amount"          in df.columns else None
+        med_col  = "medicine_cost"  if "medicine_cost"   in df.columns else None
+        inscop_col = "insurance_copay" if "insurance_copay" in df.columns else None
+        patcop_col = "patient_copay"   if "patient_copay"   in df.columns else None
+        gender_col = "gender"       if "gender"          in df.columns else None
+        ptype_col  = "patient_type" if "patient_type"    in df.columns else None
+        newborn_col= "is_newborn"   if "is_newborn"       in df.columns else None
 
-            card_class = "vc-card-clean"
-            tag = ""
-            if pc in ghost_vouchers:
-                card_class = "vc-card-ghost"
-                tag = "👻 No facility record found — investigate"
-            elif pc in high_cost_vouchers:
-                card_class = "vc-card-highcost"
-                tag = row.get("_flag_reason", "High cost / high frequency")
-            elif str(row.get(repeat_id_col, "")) in repeat_patient_ids:
-                card_class = "vc-card-repeat"
-                tag = "🔁 Patient has multiple visits this period"
+        name = str(row.get(pnm_col, "—")) if pnm_col else "—"
+        rama = str(row.get(rama_col, "—")) if rama_col else "—"
+        doc  = str(row.get(doc_col, "—")) if doc_col else "—"
+        doctp = str(row.get(doctp_col, "")) if doctp_col else ""
+        dt = row.get(date_col)
+        dt_str = pd.to_datetime(dt, errors="coerce").strftime("%d %b %Y") if date_col and pd.notna(dt) else "—"
+        facility = str(row.get(fac_col, "")) if fac_col and pd.notna(row.get(fac_col)) else ""
 
-            name = str(row.get(pnm_col, "—")) if pnm_col else "—"
-            rama = str(row.get(rama_col, "—")) if rama_col else "—"
-            doc = str(row.get(doc_col, "—")) if doc_col else "—"
-            dt = row.get(date_col)
-            dt_str = pd.to_datetime(dt, errors="coerce").strftime("%d/%m/%Y") if date_col and pd.notna(dt) else "—"
-            total_cost = pd.to_numeric(row.get(tot_col), errors="coerce") if tot_col else None
-            med_cost = pd.to_numeric(row.get(med_col), errors="coerce") if med_col else None
+        tag, tag_cls = "", ""
+        if pc in ghost_vouchers:
+            tag, tag_cls = "👻 No facility record found", "vcd-tag-ghost"
+        elif pc in high_cost_vouchers:
+            tag, tag_cls = high_cost_reason_map.get(pc, "High cost / high frequency"), "vcd-tag-highcost"
+        elif str(row.get(repeat_id_col, "")) in repeat_patient_ids:
+            tag, tag_cls = "🔁 Patient has multiple visits this period", "vcd-tag-repeat"
 
-            with st.container():
-                st.markdown(f"""
-<div class='vc-card {card_class}'>
-  <div class='vc-row'>
-    <div>
-      <div class='vc-name'>{name}</div>
-      <div class='vc-pc'>Paper Code: {pc}  ·  RAMA: {rama}</div>
-      <div class='vc-meta'>📅 {dt_str}   👨‍⚕️ {doc[:35]}</div>
-      {f"<div class='vc-tag'>{tag}</div>" if tag else ""}
-    </div>
-    <div style='text-align:right'>
-      <div class='vc-cost'>RWF {0 if pd.isna(total_cost) else total_cost:,.0f}</div>
-      <div class='vc-meta'>Medicine: RWF {0 if (med_cost is None or pd.isna(med_cost)) else med_cost:,.0f}</div>
-    </div>
+        # ── Top bar ───────────────────────────────────────────────────────────
+        st.markdown(f"""
+<div class='vcd-topbar'>
+  <div>
+    <span class='vcd-name'>{name}</span><span class='vcd-pc'>#{pc}</span>
+    <div class='vcd-sub'>Card {active_idx + 1} of {len(queue_df)}{"  ·  " + tag if tag else ""}</div>
+  </div>
+  <div>{f"<span class='vcd-badge {tag_cls}'>{tag}</span>" if tag else "<span class='vcd-badge'>Verified</span>"}</div>
+</div>""", unsafe_allow_html=True)
+
+        # ── Facility row ──────────────────────────────────────────────────────
+        if facility:
+            st.markdown(f"""
+<div class='vcd-section'>
+  🏥 <b style='color:#e2e8f0'>{facility}</b>
+  <span class='vcd-badge' style='margin-left:8px'>System Prescription</span>
+</div>""", unsafe_allow_html=True)
+
+        # ── Practitioner + dates ──────────────────────────────────────────────
+        st.markdown(f"""
+<div class='vcd-section'>
+  <div class='vcd-row'>
+    <span>👨‍⚕️ <b style='color:#e2e8f0'>{doc}</b>{f" <span class='vcd-label'>({doctp})</span>" if doctp else ""}</span>
+  </div>
+  <div class='vcd-row'>
+    <span class='vcd-label'>📅 Dispensing date</span>
+    <span class='vcd-value'>{dt_str}</span>
   </div>
 </div>""", unsafe_allow_html=True)
 
-                cc1, cc2, cc3 = st.columns([1.3, 1, 2.2])
-                with cc1:
-                    status = st.selectbox(
-                        "Status", STATUS_OPTIONS,
-                        index=STATUS_OPTIONS.index(default_status) if default_status in STATUS_OPTIONS else 0,
-                        key=f"vc_status_{pc}", label_visibility="collapsed",
-                    )
-                with cc2:
-                    deduction = st.number_input(
-                        "Deduction (RWF)", min_value=0.0,
-                        value=float(default_ded), step=1000.0,
-                        key=f"vc_ded_{pc}", label_visibility="collapsed",
-                    )
-                with cc3:
-                    reason = st.text_input(
-                        "Reason / comment", value=default_reason,
-                        placeholder="e.g. Quantity exceeds RSSB limit for amoxicillin",
-                        key=f"vc_reason_{pc}", label_visibility="collapsed",
-                    )
+        # ── Two-column metadata block (only real columns from the file) ──────
+        pstats = patient_period_stats(df, rama) if rama_col else {"visits": 0, "amount_consumed": 0, "avg_per_voucher": 0}
+        total_cost = pd.to_numeric(row.get(tot_col), errors="coerce") if tot_col else None
+        med_cost = pd.to_numeric(row.get(med_col), errors="coerce") if med_col else None
+        ins_cop = pd.to_numeric(row.get(inscop_col), errors="coerce") if inscop_col else None
+        pat_cop = pd.to_numeric(row.get(patcop_col), errors="coerce") if patcop_col else None
 
-                # Persist into the draft sheet whenever something is set
-                if status != "Verified" or deduction > 0 or reason.strip():
-                    vc_decisions[pc] = {
-                        "status": status, "deduction": deduction, "reason": reason,
-                        "patient": name, "rama": rama,
-                    }
-                elif pc in vc_decisions:
-                    # Reverted back to clean/verified with no deduction — drop it
-                    del vc_decisions[pc]
+        def _nz(v):
+            return 0 if v is None or pd.isna(v) else v
 
-                st.markdown("<hr style='border-color:#1e2a38;margin:4px 0 18px'>", unsafe_allow_html=True)
+        left_rows = [
+            ("Visits in loaded period", f"{pstats['visits']:,}"),
+            ("Amount consumed in period", f"RWF {_nz(pstats['amount_consumed']):,.0f}"),
+            ("Average per voucher", f"RWF {_nz(pstats['avg_per_voucher']):,.0f}"),
+        ]
+        if gender_col and pd.notna(row.get(gender_col)):
+            left_rows.append(("Patient gender", str(row[gender_col])))
 
-    st.session_state["vc_decisions"] = vc_decisions
+        right_rows = []
+        if newborn_col and pd.notna(row.get(newborn_col)):
+            right_rows.append(("Newborn infant?", str(row[newborn_col])))
+        right_rows.append(("Affiliation / RAMA number", rama))
+        if ptype_col and pd.notna(row.get(ptype_col)):
+            right_rows.append(("Patient type", str(row[ptype_col])))
+        if ins_cop is not None:
+            right_rows.append(("Insurance contribution", f"RWF {_nz(ins_cop):,.0f}"))
+        if pat_cop is not None:
+            right_rows.append(("Patient contribution", f"RWF {_nz(pat_cop):,.0f}"))
+
+        mcol1, mcol2 = st.columns(2)
+        with mcol1:
+            rows_html = "".join(
+                f"<div class='vcd-row'><span class='vcd-label'>{lbl}</span>"
+                f"<span class='vcd-value'>{val}</span></div>" for lbl, val in left_rows
+            )
+            st.markdown(f"<div class='vcd-section'>{rows_html}</div>", unsafe_allow_html=True)
+        with mcol2:
+            rows_html = "".join(
+                f"<div class='vcd-row'><span class='vcd-label'>{lbl}</span>"
+                f"<span class='vcd-value'>{val}</span></div>" for lbl, val in right_rows
+            )
+            st.markdown(f"<div class='vcd-section'>{rows_html}</div>", unsafe_allow_html=True)
+
+        # ── Cost summary ──────────────────────────────────────────────────────
+        st.markdown(f"""
+<div class='vcd-section' style='display:flex;justify-content:space-between;align-items:center'>
+  <span class='vcd-label'>Medicine cost</span>
+  <span class='vcd-value'>RWF {_nz(med_cost):,.0f}</span>
+</div>
+<div class='vcd-section' style='display:flex;justify-content:space-between;align-items:center'>
+  <span style='font-size:13px;color:#64748b;font-family:monospace'>Total cost</span>
+  <span style='font-size:20px;font-weight:800;color:#00e5a0;font-family:Syne,sans-serif'>
+    RWF {_nz(total_cost):,.0f}</span>
+</div>""", unsafe_allow_html=True)
+
+        # ── Verification controls ──────────────────────────────────────────────
+        st.markdown('<div class="sec-head">✍️ Verification</div>', unsafe_allow_html=True)
+        default_status = existing.get("status", "Ghost Prescription" if pc in ghost_vouchers else
+                                       "Signature Mismatch" if (pc in high_cost_vouchers or
+                                       str(row.get(repeat_id_col, "")) in repeat_patient_ids) else "Verified")
+        default_ded = existing.get("deduction", 0.0)
+        default_reason = existing.get("reason", "")
+
+        vcc1, vcc2 = st.columns(2)
+        with vcc1:
+            status = st.selectbox("Status", STATUS_OPTIONS,
+                index=STATUS_OPTIONS.index(default_status) if default_status in STATUS_OPTIONS else 0,
+                key=f"vc_status_{pc}")
+        with vcc2:
+            deduction = st.number_input("Deduction (RWF)", min_value=0.0,
+                value=float(default_ded), step=1000.0, key=f"vc_ded_{pc}")
+        reason = st.text_input("Reason / comment", value=default_reason,
+            placeholder="e.g. Quantity exceeds RSSB limit for amoxicillin",
+            key=f"vc_reason_{pc}")
+
+        if status != "Verified" or deduction > 0 or reason.strip():
+            vc_decisions[pc] = {"status": status, "deduction": deduction, "reason": reason,
+                                 "patient": name, "rama": rama}
+        elif pc in vc_decisions:
+            del vc_decisions[pc]
+        st.session_state["vc_decisions"] = vc_decisions
+
+        # ── Previous / Next navigation ────────────────────────────────────────
+        nav1, nav2, nav3 = st.columns([1, 2, 1])
+        with nav1:
+            if st.button("⬅ Previous", use_container_width=True,
+                         disabled=(active_idx <= 0), key="vc_prev_btn"):
+                st.session_state["vc_active_idx"] = active_idx - 1
+                st.rerun()
+        with nav2:
+            st.markdown(f"<div style='text-align:center;color:#475569;font-size:12px;"
+                        f"font-family:monospace;padding-top:8px'>Card {active_idx+1} of {len(queue_df)}</div>",
+                        unsafe_allow_html=True)
+        with nav3:
+            if st.button("Next ➡", use_container_width=True,
+                         disabled=(active_idx >= len(queue_df) - 1), key="vc_next_btn"):
+                st.session_state["vc_active_idx"] = active_idx + 1
+                st.rerun()
 
     # ── Draft sheet ───────────────────────────────────────────────────────────
     st.markdown('<div class="sec-head">📋 Draft Sheet — All Logged Decisions</div>', unsafe_allow_html=True)
 
     if not vc_decisions:
-        st.info("No decisions logged yet. Set a status, deduction, or reason on any card above "
+        st.info("No decisions logged yet. Set a status, deduction, or reason on the card above "
                  "and it will appear here automatically.")
     else:
         draft_rows = [{

@@ -10,6 +10,7 @@ Run:
 
 import difflib
 import io
+import math
 import re
 import warnings
 from collections import defaultdict as _dd
@@ -363,7 +364,6 @@ def load_and_process(file_bytes: bytes, filename: str, rapid_days: int):
                 "visit_1": rapid_df["_prev_date"].dt.strftime("%Y-%m-%d").tolist(),
                 "visit_2": rapid_df["visit_date"].dt.strftime("%Y-%m-%d").tolist(),
                 "days_apart": rapid_df["_days_diff"].astype(int).tolist(),
-                "voucher_id": rapid_df["voucher_id"].astype(str).tolist() if "voucher_id" in rapid_df.columns else [""] * len(rapid_df),
             }
             if dcol and dcol in rapid_df.columns:
                 rapid_dict["doctor"] = rapid_df[dcol].astype(str).tolist()
@@ -2032,8 +2032,8 @@ def generate_counter_verification_xlsx(
         "Paper Code", "Dispensing Date", "Patient Name", "RAMA Number",
         "Practitioner Name", "Health Facility", "Date of Treatment", "Verified",
         "Total Before Counter-V (RWF)", "85% After Counter-V (RWF)",
-        "100% after cv", "85% after cv",
-        "difference", "Explanation",
+        "After Counter-V 100%", "After Counter-V 85%",
+        "Amount Deducted (RWF)", "Explanation",
     ]
     for ci, h in enumerate(headers_s1, 1):
         c = ws1.cell(row=1, column=ci, value=h)
@@ -2079,9 +2079,8 @@ def generate_counter_verification_xlsx(
 
         # ded_amount is negative (e.g. -11342); use abs for arithmetic
         total_85  = round(ins_co * 0.85, 2)
-        total_val = _safe_float(_get_col(row, tot_col, "amount", "total_cost"))
-        after_100 = round(total_val - abs(ded_amount), 2)
-        after_85  = round(ins_co - abs(ded_amount), 2)
+        after_100 = round(ins_co - abs(ded_amount), 2)
+        after_85  = round(after_100 * 0.85, 2)
 
         row_vals = [
             pc,
@@ -2373,6 +2372,270 @@ def generate_counter_verification_xlsx(
     return buf.read()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# VERIFICATION CARDS — supporting helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Known high-cost / frequently-abused drug names (Faith_Pharmacy / RSSB context).
+# Matched as case-insensitive substrings against drug_name / medicine description.
+_HIGH_COST_DRUG_HINTS = [
+    "crestor", "galvus met", "galvus", "keppra", "humira", "enbrel",
+    "eliquis", "xarelto", "januvia", "lantus", "novorapid", "trajenta",
+    "forxiga", "jardiance", "lyrica", "rivotril",
+]
+
+
+def _vc_id_col(df_: pd.DataFrame) -> str | None:
+    for k in ("voucher_id", "paper_code"):
+        if k in df_.columns:
+            return k
+    return None
+
+
+def build_high_cost_queue(df: pd.DataFrame, cost_percentile: float = 0.9,
+                           min_practitioner_repeats: int = 3) -> pd.DataFrame:
+    """
+    Flags claims for the 'High-Cost / High-Frequency' physical review queue:
+      • medicine_cost (or amount) above the given percentile threshold, OR
+      • drug name matches a known high-cost/abuse-prone drug, OR
+      • billed by a practitioner who repeatedly bills the same high-cost drug.
+    Returns a dataframe of flagged rows with a `_flag_reason` column, sorted
+    by cost descending.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    cost_col = "medicine_cost" if "medicine_cost" in df.columns else (
+        "amount" if "amount" in df.columns else None)
+    if cost_col is None:
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["_cost"] = pd.to_numeric(work[cost_col], errors="coerce").fillna(0)
+    doc_col  = "doctor_name" if "doctor_name" in work.columns else None
+    drug_col = "drug_name"   if "drug_name"   in work.columns else None
+
+    threshold = work["_cost"].quantile(cost_percentile) if len(work) else 0
+    reasons = pd.Series([""] * len(work), index=work.index, dtype=object)
+
+    # Rule 1 — cost above percentile threshold
+    mask_cost = work["_cost"] >= threshold if threshold > 0 else pd.Series(False, index=work.index)
+    reasons.loc[mask_cost] += f"Cost ≥ top {int((1-cost_percentile)*100)}% (RWF {threshold:,.0f}+); "
+
+    # Rule 2 — known high-cost / frequently-abused drug name
+    mask_drug = pd.Series(False, index=work.index)
+    if drug_col:
+        low = work[drug_col].fillna("").astype(str).str.lower()
+        for hint in _HIGH_COST_DRUG_HINTS:
+            mask_drug = mask_drug | low.str.contains(hint, regex=False)
+        reasons.loc[mask_drug] += "Known high-cost/expensive drug; "
+
+    # Rule 3 — same practitioner repeatedly billing the same high-cost drug
+    mask_practitioner = pd.Series(False, index=work.index)
+    if doc_col and drug_col:
+        grp = work.groupby([doc_col, drug_col]).size()
+        repeat_pairs = set(grp[grp >= min_practitioner_repeats].index)
+        if repeat_pairs:
+            pair_keys = list(zip(work[doc_col], work[drug_col]))
+            mask_practitioner = pd.Series(
+                [k in repeat_pairs for k in pair_keys], index=work.index
+            )
+            # Only count it as a frequency flag if cost is non-trivial too
+            mask_practitioner = mask_practitioner & (work["_cost"] > 0)
+        reasons.loc[mask_practitioner] += (
+            f"Practitioner billed same drug {min_practitioner_repeats}+ times; "
+        )
+
+    flagged_mask = mask_cost | mask_drug | mask_practitioner
+    out = work[flagged_mask].copy()
+    out["_flag_reason"] = reasons[flagged_mask].str.rstrip("; ")
+    out = out.sort_values("_cost", ascending=False)
+    return out
+
+
+def build_repeat_visit_queue(repeat_groups: list[dict], min_visits: int = 2) -> pd.DataFrame:
+    """Thin wrapper turning repeat_groups into a review-queue dataframe."""
+    if not repeat_groups:
+        return pd.DataFrame()
+    qdf = pd.DataFrame(repeat_groups)
+    qdf = qdf[qdf["visits"] >= min_visits].sort_values("visits", ascending=False)
+    return qdf
+
+
+def generate_rssb_final_xlsx(
+    df: pd.DataFrame,
+    decisions: dict,
+    meta: dict,
+) -> bytes:
+    """
+    Build the final RSSB-format Excel export directly from in-app card
+    decisions (no annotated-file upload needed).
+
+    `decisions` is a dict keyed by paper_code/voucher_id with values:
+        {"status": str, "deduction": float (positive RWF), "reason": str}
+
+    Produces the exact RSSB MAY 2024 FINAL.xlsx (Sheet1) columns:
+        100% after cv  = Original Total Cost   - Deduction
+        85% after cv   = Original Insurance Co-payment - Deduction
+        difference     = Deduction amount
+    plus the identifying columns and a metadata block (province, district,
+    pharmacy, period) matching the existing counter-verification report.
+    """
+    import io as _io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    C_BLUE, C_GOLD, C_GREY, C_WHITE, C_TEXT = "003366", "FFCC00", "F4F4F4", "FFFFFF", "333333"
+    C_RED, C_GREEN, C_AMBER = "C0392B", "1E7E34", "B8860B"
+    C_FILL_GREEN, C_FILL_AMBER, C_TITLE_BG = "D4EDDA", "FFF3CD", "E8F0F7"
+
+    def fill(c): return PatternFill("solid", fgColor=c)
+    def font(name="Calibri", bold=False, size=11.0, color=C_TEXT):
+        return Font(name=name, bold=bold, size=size, color=color)
+    def side(style="thin", color="AAAAAA"): return Side(border_style=style, color=color)
+    THIN, MED_B, MED_G = side(), side("medium", C_BLUE), side("medium", C_GOLD)
+
+    def border_all(s): return Border(left=s, right=s, top=s, bottom=s)
+
+    A_C = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    A_L = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+    A_R = Alignment(horizontal="right",  vertical="center")
+
+    vid_col = _vc_id_col(df) or "voucher_id"
+    pnm_col = "patient_name" if "patient_name" in df.columns else None
+    rama_col = "patient_id" if "patient_id" in df.columns else None
+    doc_col  = "doctor_name" if "doctor_name" in df.columns else None
+    date_col = "visit_date" if "visit_date" in df.columns else None
+    tot_col  = "amount" if "amount" in df.columns else None
+    ins_col  = "insurance_copay" if "insurance_copay" in df.columns else None
+    med_col  = "medicine_cost" if "medicine_cost" in df.columns else None
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A2"
+
+    headers = [
+        "Paper Code", "Dispensing Date", "Patient Name", "RAMA Number",
+        "Practitioner Name", "Status", "Total Cost (RWF)",
+        "Insurance Co-payment (RWF)", "Medicine Cost (RWF)",
+        "100% after cv", "85% after cv", "difference", "Reason",
+    ]
+    widths = [14, 16, 22, 22, 26, 16, 16, 18, 16, 16, 16, 14, 30]
+    for ci, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(1, ci, h)
+        c.font, c.fill, c.alignment = font(bold=True, color=C_WHITE), fill(C_BLUE), A_C
+        c.border = Border(left=MED_B, right=MED_B, top=MED_B, bottom=MED_G)
+    ws.row_dimensions[1].height = 30
+
+    ri = 2
+    n_deducted = 0
+    total_100 = total_85 = total_diff = 0.0
+    for _, row in df.iterrows():
+        pc = str(row.get(vid_col, "")).strip()
+        dec = decisions.get(pc, {})
+        status = dec.get("status", "Verified")
+        deduction = float(dec.get("deduction", 0) or 0)
+        reason = dec.get("reason", "")
+
+        total_cost = pd.to_numeric(row.get(tot_col), errors="coerce") if tot_col else 0
+        total_cost = 0 if pd.isna(total_cost) else float(total_cost)
+        ins_copay  = pd.to_numeric(row.get(ins_col), errors="coerce") if ins_col else 0
+        ins_copay  = 0 if pd.isna(ins_copay) else float(ins_copay)
+        med_cost   = pd.to_numeric(row.get(med_col), errors="coerce") if med_col else 0
+        med_cost   = 0 if pd.isna(med_cost) else float(med_cost)
+
+        after_100 = round(total_cost - deduction, 2)
+        after_85  = round(ins_copay - deduction, 2)
+        diff      = round(deduction, 2)
+
+        if deduction > 0:
+            n_deducted += 1
+        total_100 += after_100
+        total_85  += after_85
+        total_diff += diff
+
+        vals = [
+            pc,
+            row.get(date_col) if date_col else "",
+            str(row.get(pnm_col, "")) if pnm_col else "",
+            str(row.get(rama_col, "")) if rama_col else "",
+            str(row.get(doc_col, "")) if doc_col else "",
+            status,
+            total_cost, ins_copay, med_cost,
+            after_100, after_85, diff, reason,
+        ]
+        zebra = fill(C_WHITE) if (ri % 2 == 0) else fill(C_GREY)
+        for ci, v in enumerate(vals, 1):
+            c = ws.cell(ri, ci, v)
+            c.border = border_all(THIN)
+            c.fill = zebra
+            if ci == 2 and date_col:
+                c.number_format = "dd/mm/yyyy"
+                c.alignment = A_C
+            elif ci == 6:
+                is_clean = status.lower() in ("verified",)
+                c.font = font(bold=True, color=(C_GREEN if is_clean else C_AMBER))
+                c.fill = fill(C_FILL_GREEN if is_clean else C_FILL_AMBER)
+                c.alignment = A_C
+            elif ci in (7, 8, 9, 10, 11, 12):
+                c.number_format = "#,##0.00"
+                c.alignment = A_R
+                if ci == 12 and diff:
+                    c.font = font(color=C_RED)
+            elif ci == 13:
+                c.alignment = A_L
+            else:
+                c.alignment = A_L
+        ri += 1
+
+    # Totals row
+    tot_ri = ri
+    ws.cell(tot_ri, 6, "TOTAL")
+    for ci in range(1, 14):
+        c = ws.cell(tot_ri, ci)
+        c.font = font(bold=True, color=C_WHITE)
+        c.fill = fill(C_BLUE)
+        c.border = Border(left=MED_B, right=MED_B, top=MED_G, bottom=MED_B)
+    for ci, col_letter in [(7, "G"), (8, "H"), (9, "I"), (10, "J"), (11, "K"), (12, "L")]:
+        c = ws.cell(tot_ri, ci, f"=SUM({col_letter}2:{col_letter}{tot_ri-1})")
+        c.number_format = "#,##0.00"
+        c.alignment = A_R
+
+    # ── Metadata block (province, district, pharmacy, period, code) ─────────
+    meta_start = tot_ri + 3
+    ws.merge_cells(f"A{meta_start}:E{meta_start+2}")
+    t = ws[f"A{meta_start}"]
+    t.value = "RSSB FINAL DEDUCTION REPORT"
+    t.font = font(bold=True, size=20, color=C_BLUE)
+    t.fill = fill(C_TITLE_BG)
+    t.alignment = A_C
+    for r in range(meta_start, meta_start + 3):
+        ws.row_dimensions[r].height = 22
+
+    meta_rows = [
+        ("PROVINCE:",               meta.get("province", "")),
+        ("ADMINISTRATIVE DISTRICT:",meta.get("district", "")),
+        ("PHARMACY:",               meta.get("pharmacy", "")),
+        ("PERIOD:",                 meta.get("period", "")),
+        ("CODE:",                   meta.get("code", "")),
+    ]
+    for i, (label, value) in enumerate(meta_rows):
+        rn = meta_start + 3 + i
+        lc = ws.cell(rn, 1, label)
+        lc.font = font(bold=True, size=12, color=C_BLUE)
+        vc = ws.cell(rn, 3, value)
+        vc.font = font(bold=True, size=12, color=C_TEXT)
+
+    buf = _io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -2429,7 +2692,7 @@ with st.sidebar:
 
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🗑️ Clear Data Lake", use_container_width=True, type="secondary"):
-            for k in ["data_lake","dp_result","dp_map_used","raw_bytes","raw_filename", "verifications"]:
+            for k in ["data_lake","dp_result","dp_map_used","raw_bytes","raw_filename"]:
                 st.session_state.pop(k, None)
             st.rerun()
     else:
@@ -2456,28 +2719,20 @@ with st.sidebar:
 
 # ── Store raw bytes when file is uploaded ─────────────────────────────────────
 if uploaded is not None:
-    if uploaded.size > 200 * 1024 * 1024:
-        st.warning("⚠️ Large file detected (> 200MB). Processing may take some time.")
-    try:
-        _raw_bytes_new = uploaded.read()
-    except Exception as e:
-        st.error(f"Failed to read uploaded file: {e}")
-        st.stop()
+    _raw_bytes_new = uploaded.read()
     _new_name = uploaded.name
     if st.session_state.get("raw_filename") != _new_name:
         st.session_state["raw_bytes"]    = _raw_bytes_new
         st.session_state["raw_filename"] = _new_name
         # New file → clear data lake so user re-runs Data Prep
         for _k in ["data_lake", "dp_result", "dp_map_used", "normalised_df",
-                   "normalised_col", "normalised_map", "ann_df", "ann_detected", "verifications"]:
+                   "normalised_col", "normalised_map", "ann_df", "ann_detected"]:
             st.session_state.pop(_k, None)
         st.rerun()
     elif "raw_bytes" not in st.session_state:
         st.session_state["raw_bytes"]    = _raw_bytes_new
         st.session_state["raw_filename"] = _new_name
 
-if "verifications" not in st.session_state:
-    st.session_state["verifications"] = {}
 # ── Landing page (no file yet) ────────────────────────────────────────────────
 if "raw_bytes" not in st.session_state:
     st.markdown("""
@@ -2497,7 +2752,7 @@ if "raw_bytes" not in st.session_state:
     for _col, _icon, _title, _desc in zip(
         [_f1, _f2, _f3, _f4],
         ["🗂️", "🔍", "🕸️", "🛡️"],
-        ["Data Prep & Lake", "Ghost Prescription Tracker", "Network Graph", "Rules Engine"],
+        ["Data Prep & Lake", "Cross-Facility Match", "Network Graph", "Rules Engine"],
         [
             "Map columns from any file format once — all analysis reads from your committed data lake",
             "Fuzzy RAMA + name matching against clinic/hospital visit files to surface phantom claims",
@@ -2569,15 +2824,16 @@ def _render_tab_locked(tab_name: str = ""):
 </div>""", unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-(tab_dataprep, tab_cv, tab_summary, tab_records, tab_repeat,
- tab_network, tab_xfac) = st.tabs([
+(tab_dataprep, tab_summary, tab_records, tab_verify, tab_repeat,
+ tab_network, tab_xfac, tab_cv) = st.tabs([
     "🗂️ Data Prep",
-    "📄 Counter-Verification",
     "📊 Summary",
     "📋 All Records",
+    f"🗳️ Verification Cards  {'🟠' if st.session_state.get('vc_decisions') else ''}",
     f"🔁 Repeat Patients  {'🟡' if repeat_groups or rapid else '🟢'}  {len(repeat_groups)}",
     "🕸️ Network Graph",
-    "🏥 Ghost Prescription Tracker",
+    "🏥 Cross-Facility Match",
+    "📄 Counter-Verification",
 ])
 
 # ══ SUMMARY ══════════════════════════════════════════════════════════════════
@@ -2672,6 +2928,316 @@ with tab_records:
         display_df = display_df[mask]
         st.caption(f"{len(display_df):,} matching rows")
     st.dataframe(display_df, use_container_width=True, height=520)
+
+# ══ VERIFICATION CARDS ════════════════════════════════════════════════════════
+with tab_verify:
+  if not _dl_committed:
+    _render_tab_locked("Verification Cards")
+  else:
+    st.markdown("""
+<style>
+.vc-card{background:#111720;border:1px solid #1e2a38;border-radius:12px;
+         padding:16px 18px;margin-bottom:14px;transition:border-color .15s}
+.vc-card:hover{border-color:#2d3f54}
+.vc-card-ghost{border-left:3px solid #ef4444}
+.vc-card-highcost{border-left:3px solid #f59e0b}
+.vc-card-repeat{border-left:3px solid #a78bfa}
+.vc-card-clean{border-left:3px solid #1e2a38}
+.vc-row{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px}
+.vc-name{font-size:14px;font-weight:700;color:#e2e8f0;font-family:Syne,sans-serif}
+.vc-pc{font-size:11px;color:#475569;font-family:monospace}
+.vc-cost{font-size:18px;font-weight:800;color:#00e5a0;font-family:Syne,sans-serif}
+.vc-meta{font-size:11px;color:#64748b;font-family:monospace;margin-top:2px}
+.vc-tag{display:inline-block;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);
+        color:#fca5a5;border-radius:5px;padding:1px 8px;font-size:10px;font-family:monospace;
+        margin-top:6px}
+</style>""", unsafe_allow_html=True)
+
+    st.markdown("""
+<div style='font-family:Syne,sans-serif;font-size:26px;font-weight:800;color:#e2e8f0;
+     margin-bottom:4px'>🗳️ Verification Cards</div>
+<div style='color:#64748b;font-size:13px;margin-bottom:18px;font-family:monospace'>
+  Review each claim as a card — set status, deduction, and reason directly in the app.
+  No more download → edit in Excel → re-upload. Everything below feeds the
+  draft sheet and the final RSSB report automatically.
+</div>""", unsafe_allow_html=True)
+
+    # ── Persistent decision store ───────────────────────────────────────────
+    # Keyed by Paper Code / Voucher ID → {status, deduction, reason}
+    if "vc_decisions" not in st.session_state:
+        st.session_state["vc_decisions"] = {}
+    vc_decisions = st.session_state["vc_decisions"]
+
+    vid_col = _vc_id_col(df)
+    if vid_col is None:
+        st.error("❌ No Paper Code / Voucher ID column found in the committed data. "
+                  "Check column mapping in Data Prep.")
+        st.stop()
+
+    STATUS_OPTIONS = ["Verified", "Deducted", "Ghost Prescription", "Signature Mismatch"]
+
+    # ── Pull ghost-prescription results from Cross-Facility Match (if run) ───
+    _xfac_cache = st.session_state.get("xfac_last_result")  # set in Cross-Facility tab
+    ghost_vouchers = set()
+    if _xfac_cache is not None and not _xfac_cache.empty:
+        _ghost_df = _xfac_cache[_xfac_cache["status"] == "NO_RECORD"]
+        ghost_vouchers = set(_ghost_df["ph_voucher"].astype(str).str.strip())
+
+    # ── Build the four queues ────────────────────────────────────────────────
+    high_cost_df = build_high_cost_queue(df)
+    high_cost_vouchers = set(high_cost_df[vid_col].astype(str).str.strip()) if vid_col in high_cost_df.columns and not high_cost_df.empty else set()
+
+    repeat_id_col = s.get("patient_col", "patient_id")
+    repeat_patient_ids = {str(g.get(repeat_id_col, g.get("patient_id", ""))) for g in repeat_groups if g["visits"] >= 2}
+
+    # ── Queue selector ───────────────────────────────────────────────────────
+    qc1, qc2 = st.columns([3, 1])
+    with qc1:
+        queue_choice = st.radio(
+            "Queue",
+            ["🔴 Ghost Prescriptions", "🟠 High-Cost / High-Frequency",
+             "🟣 Repeat Visits", "⚪ All Claims"],
+            horizontal=True, label_visibility="collapsed", key="vc_queue",
+        )
+    with qc2:
+        cards_per_page = st.selectbox("Cards / page", [10, 20, 50], index=1, key="vc_per_page")
+
+    # Build the working set for the selected queue
+    work = df.copy()
+    work["_pc"] = work[vid_col].astype(str).str.strip()
+
+    if queue_choice.startswith("🔴"):
+        if not ghost_vouchers:
+            st.info("👉 Run **Cross-Facility Match** first (upload hospital/clinic files there) "
+                     "to populate the Ghost Prescription queue. Showing nothing until then.")
+            queue_df = work.iloc[0:0]
+        else:
+            queue_df = work[work["_pc"].isin(ghost_vouchers)].copy()
+            queue_df["_default_status"] = "Ghost Prescription"
+    elif queue_choice.startswith("🟠"):
+        queue_df = work[work["_pc"].isin(high_cost_vouchers)].copy()
+        # attach flag reason for display
+        if not high_cost_df.empty:
+            _reason_map = dict(zip(high_cost_df[vid_col].astype(str).str.strip(),
+                                    high_cost_df["_flag_reason"]))
+            queue_df["_flag_reason"] = queue_df["_pc"].map(_reason_map).fillna("")
+        queue_df["_default_status"] = "Signature Mismatch"
+    elif queue_choice.startswith("🟣"):
+        if repeat_id_col in work.columns:
+            queue_df = work[work[repeat_id_col].astype(str).isin(repeat_patient_ids)].copy()
+        else:
+            queue_df = work.iloc[0:0]
+        queue_df["_default_status"] = "Signature Mismatch"
+    else:
+        queue_df = work.copy()
+        queue_df["_default_status"] = "Verified"
+
+    # Sort: most expensive first for review efficiency
+    sort_col = "medicine_cost" if "medicine_cost" in queue_df.columns else (
+        "amount" if "amount" in queue_df.columns else None)
+    if sort_col and not queue_df.empty:
+        queue_df = queue_df.sort_values(sort_col, ascending=False)
+
+    # ── Queue summary strip ───────────────────────────────────────────────────
+    qm1, qm2, qm3, qm4 = st.columns(4)
+    qm1.metric("Cards in queue", f"{len(queue_df):,}")
+    n_reviewed = sum(1 for pc in queue_df["_pc"] if pc in vc_decisions) if not queue_df.empty else 0
+    qm2.metric("Reviewed", f"{n_reviewed:,}")
+    qm3.metric("Remaining", f"{len(queue_df) - n_reviewed:,}")
+    n_deducted_total = sum(1 for d in vc_decisions.values() if d.get("deduction", 0) > 0)
+    qm4.metric("Total deductions logged", f"{n_deducted_total:,}")
+
+    if queue_df.empty:
+        st.success("✅ Nothing in this queue right now.")
+    else:
+        # ── Search / filter within queue ──────────────────────────────────
+        fc1, fc2 = st.columns([3, 1])
+        with fc1:
+            vc_search = st.text_input("🔍 Filter cards", key="vc_search",
+                                       placeholder="Name, RAMA, paper code, practitioner…")
+        with fc2:
+            hide_reviewed = st.checkbox("Hide reviewed", value=False, key="vc_hide_reviewed")
+
+        disp = queue_df.copy()
+        if vc_search:
+            mask = disp.apply(lambda c: c.astype(str).str.contains(vc_search, case=False, na=False)).any(axis=1)
+            disp = disp[mask]
+        if hide_reviewed:
+            disp = disp[~disp["_pc"].isin(vc_decisions.keys())]
+
+        total_pages = max(1, math.ceil(len(disp) / cards_per_page))
+        page = st.number_input("Page", 1, total_pages, 1, key="vc_page") if total_pages > 1 else 1
+        page_slice = disp.iloc[(page - 1) * cards_per_page : page * cards_per_page]
+
+        st.markdown(f"<div style='font-size:11px;color:#64748b;font-family:monospace;margin:6px 0 14px'>"
+                    f"Showing {len(page_slice)} of {len(disp):,} cards in this queue "
+                    f"(page {page} of {total_pages})</div>", unsafe_allow_html=True)
+
+        pnm_col = "patient_name" if "patient_name" in df.columns else None
+        rama_col = "patient_id" if "patient_id" in df.columns else None
+        doc_col = "doctor_name" if "doctor_name" in df.columns else None
+        date_col = "visit_date" if "visit_date" in df.columns else None
+        tot_col = "amount" if "amount" in df.columns else None
+        med_col = "medicine_cost" if "medicine_cost" in df.columns else None
+
+        for _, row in page_slice.iterrows():
+            pc = row["_pc"]
+            existing = vc_decisions.get(pc, {})
+            default_status = existing.get("status", row.get("_default_status", "Verified"))
+            default_ded = existing.get("deduction", 0.0)
+            default_reason = existing.get("reason", "")
+
+            card_class = "vc-card-clean"
+            tag = ""
+            if pc in ghost_vouchers:
+                card_class = "vc-card-ghost"
+                tag = "👻 No facility record found — investigate"
+            elif pc in high_cost_vouchers:
+                card_class = "vc-card-highcost"
+                tag = row.get("_flag_reason", "High cost / high frequency")
+            elif str(row.get(repeat_id_col, "")) in repeat_patient_ids:
+                card_class = "vc-card-repeat"
+                tag = "🔁 Patient has multiple visits this period"
+
+            name = str(row.get(pnm_col, "—")) if pnm_col else "—"
+            rama = str(row.get(rama_col, "—")) if rama_col else "—"
+            doc = str(row.get(doc_col, "—")) if doc_col else "—"
+            dt = row.get(date_col)
+            dt_str = pd.to_datetime(dt, errors="coerce").strftime("%d/%m/%Y") if date_col and pd.notna(dt) else "—"
+            total_cost = pd.to_numeric(row.get(tot_col), errors="coerce") if tot_col else None
+            med_cost = pd.to_numeric(row.get(med_col), errors="coerce") if med_col else None
+
+            with st.container():
+                st.markdown(f"""
+<div class='vc-card {card_class}'>
+  <div class='vc-row'>
+    <div>
+      <div class='vc-name'>{name}</div>
+      <div class='vc-pc'>Paper Code: {pc}  ·  RAMA: {rama}</div>
+      <div class='vc-meta'>📅 {dt_str}   👨‍⚕️ {doc[:35]}</div>
+      {f"<div class='vc-tag'>{tag}</div>" if tag else ""}
+    </div>
+    <div style='text-align:right'>
+      <div class='vc-cost'>RWF {0 if pd.isna(total_cost) else total_cost:,.0f}</div>
+      <div class='vc-meta'>Medicine: RWF {0 if (med_cost is None or pd.isna(med_cost)) else med_cost:,.0f}</div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+                cc1, cc2, cc3 = st.columns([1.3, 1, 2.2])
+                with cc1:
+                    status = st.selectbox(
+                        "Status", STATUS_OPTIONS,
+                        index=STATUS_OPTIONS.index(default_status) if default_status in STATUS_OPTIONS else 0,
+                        key=f"vc_status_{pc}", label_visibility="collapsed",
+                    )
+                with cc2:
+                    deduction = st.number_input(
+                        "Deduction (RWF)", min_value=0.0,
+                        value=float(default_ded), step=1000.0,
+                        key=f"vc_ded_{pc}", label_visibility="collapsed",
+                    )
+                with cc3:
+                    reason = st.text_input(
+                        "Reason / comment", value=default_reason,
+                        placeholder="e.g. Quantity exceeds RSSB limit for amoxicillin",
+                        key=f"vc_reason_{pc}", label_visibility="collapsed",
+                    )
+
+                # Persist into the draft sheet whenever something is set
+                if status != "Verified" or deduction > 0 or reason.strip():
+                    vc_decisions[pc] = {
+                        "status": status, "deduction": deduction, "reason": reason,
+                        "patient": name, "rama": rama,
+                    }
+                elif pc in vc_decisions:
+                    # Reverted back to clean/verified with no deduction — drop it
+                    del vc_decisions[pc]
+
+                st.markdown("<hr style='border-color:#1e2a38;margin:4px 0 18px'>", unsafe_allow_html=True)
+
+    st.session_state["vc_decisions"] = vc_decisions
+
+    # ── Draft sheet ───────────────────────────────────────────────────────────
+    st.markdown('<div class="sec-head">📋 Draft Sheet — All Logged Decisions</div>', unsafe_allow_html=True)
+
+    if not vc_decisions:
+        st.info("No decisions logged yet. Set a status, deduction, or reason on any card above "
+                 "and it will appear here automatically.")
+    else:
+        draft_rows = [{
+            "Paper Code": pc, "Patient": d.get("patient", ""), "RAMA": d.get("rama", ""),
+            "Status": d.get("status", ""), "Deduction (RWF)": d.get("deduction", 0),
+            "Reason": d.get("reason", ""),
+        } for pc, d in vc_decisions.items()]
+        draft_df = pd.DataFrame(draft_rows).sort_values("Deduction (RWF)", ascending=False)
+        draft_df.index = range(1, len(draft_df) + 1)
+
+        dm1, dm2, dm3 = st.columns(3)
+        dm1.metric("Rows in draft", f"{len(draft_df):,}")
+        dm2.metric("Total deducted (RWF)", f"{draft_df['Deduction (RWF)'].sum():,.0f}")
+        dm3.metric("Ghost prescriptions flagged",
+                   f"{(draft_df['Status'] == 'Ghost Prescription').sum():,}")
+
+        st.dataframe(draft_df, use_container_width=True, height=300)
+
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            st.download_button(
+                "⬇️ Download draft sheet (.csv)",
+                data=draft_df.to_csv(index=False).encode(),
+                file_name="verification_draft_sheet.csv",
+                mime="text/csv", key="vc_dl_draft",
+            )
+        with dcol2:
+            if st.button("🗑️ Clear all decisions", key="vc_clear_all"):
+                st.session_state["vc_decisions"] = {}
+                st.rerun()
+
+        # ── Generate final RSSB report directly from cards ───────────────────
+        st.markdown('<div class="sec-head">⬇️ Generate Final RSSB Report</div>', unsafe_allow_html=True)
+        st.markdown("""
+<div style='font-size:11px;color:#64748b;font-family:monospace;margin-bottom:12px'>
+  Builds the exact RSSB MAY 2024 FINAL.xlsx (Sheet1) columns —
+  <b style='color:#e2e8f0'>100% after cv</b>, <b style='color:#e2e8f0'>85% after cv</b>,
+  <b style='color:#e2e8f0'>difference</b> — straight from the decisions above.
+  No upload/download round-trip required.
+</div>""", unsafe_allow_html=True)
+
+        rm1, rm2 = st.columns(2)
+        with rm1:
+            vc_province = st.text_input("Province", value="WESTERN PROVINCE", key="vc_province")
+            vc_district = st.text_input("Administrative District", value="RUBAVU", key="vc_district")
+            vc_pharmacy = st.text_input("Pharmacy", value="PHARMACIE VINCA GISENYI LTD", key="vc_pharmacy")
+        with rm2:
+            _default_period = f"{s['date_min']} to {s['date_max']}" if "date_min" in s else ""
+            vc_period = st.text_input("Period", value=_default_period, key="vc_period")
+            vc_code = st.text_input("Code", value="", key="vc_code")
+
+        if st.button("📊 Generate Final RSSB Report (.xlsx)", type="primary", key="vc_gen_final"):
+            _meta = {"province": vc_province, "district": vc_district,
+                     "pharmacy": vc_pharmacy, "period": vc_period, "code": vc_code}
+            with st.spinner("Building final report…"):
+                try:
+                    _xlsx = generate_rssb_final_xlsx(df, vc_decisions, _meta)
+                    st.session_state["vc_final_xlsx"] = _xlsx
+                    st.session_state["vc_final_meta"] = (vc_pharmacy, vc_period)
+                except Exception as e:
+                    st.error(f"❌ Failed to generate report: {e}")
+                    import traceback; st.code(traceback.format_exc())
+
+        if st.session_state.get("vc_final_xlsx"):
+            pharm_s, period_s = st.session_state.get("vc_final_meta", ("pharmacy", "period"))
+            fname = (f"rssb_final_{pharm_s.replace(' ','_')[:25]}_"
+                     f"{period_s.replace(' ','_').replace('/','')[:15]}.xlsx")
+            st.success("✅ Final RSSB report ready!")
+            st.download_button(
+                "⬇️ Download Final RSSB Report (.xlsx)",
+                data=st.session_state["vc_final_xlsx"],
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="vc_dl_final",
+            )
 
 # ══ REPEAT PATIENTS ══════════════════════════════════════════════════════════
 # ══ REPEAT PATIENTS & RAPID REVISITS ═════════════════════════════════════════
@@ -2937,28 +3503,10 @@ with tab_repeat:
             # Full table
             with st.expander("📋 Full rapid revisit table", expanded=False):
                 _rv_df = pd.DataFrame(_rapid_filtered)
-                if not _rv_df.empty:
-                    _rv_df["Pushed"] = _rv_df["voucher_id"].apply(lambda x: "✅" if x in st.session_state["verifications"] else "❌")
                 st.dataframe(_rv_df, use_container_width=True, height=400)
 
             # Download
             _rv_dl = pd.DataFrame(_rapid_filtered).to_csv(index=False).encode()
-
-        if st.button("🚀 Push to Verification Dashboard", key="push_rapid"):
-            pushed_count = 0
-            for r in _rapid_filtered:
-                vid = r.get("voucher_id")
-                if vid and vid not in st.session_state["verifications"]:
-                    st.session_state["verifications"][vid] = {
-                        "status": "Pending",
-                        "deduction": 0.0,
-                        "reason": "Flagged for rapid revisit review"
-                    }
-                    pushed_count += 1
-            if pushed_count > 0:
-                st.success(f"✅ Pushed {pushed_count} cases to Verification Dashboard!")
-            else:
-                st.info("ℹ️ All cases already in Verification Dashboard.")
             st.download_button(
                 "⬇️ Download rapid revisit list",
                 data=_rv_dl,
@@ -2973,22 +3521,44 @@ with tab_network:
     _render_tab_locked("Network Graph")
   else:
 
-    # All text / categorical columns available for network nodes
-    # Handles both NumPy object and PyArrow string/large_string dtypes.
+    st.markdown('<div class="sec-head">🔧 Network Configuration</div>', unsafe_allow_html=True)
+
+    # ── Collusion-pattern preset ──────────────────────────────────────────────
+    collusion_mode = st.checkbox(
+        "🕵️ Collusion Pattern mode — Practitioner ↔ Patient, high-cost claims only",
+        value=False, key="net_collusion_mode",
+        help="Pre-fills Practitioner Name ↔ Patient Name and restricts the graph to "
+             "high-cost/high-frequency claims, so a doctor connected to an unusual "
+             "cluster of patients on the same expensive drug stands out visually.",
+    )
+
+    net_df = df
+    if collusion_mode:
+        _hc = build_high_cost_queue(df)
+        if not _hc.empty:
+            net_df = _hc.drop(columns=["_cost", "_flag_reason"], errors="ignore")
+            st.markdown(
+                f"<div style='font-size:11px;color:#f59e0b;font-family:monospace;margin-bottom:10px'>"
+                f"⚠️ Graph restricted to {len(net_df):,} high-cost/high-frequency claims "
+                f"(same source as the Verification Cards 🟠 queue). "
+                f"A doctor linked to an unusually large patient cluster here is worth pulling "
+                f"physical files for.</div>", unsafe_allow_html=True,
+            )
+        else:
+            st.info("No high-cost claims detected — showing the full dataset instead.")
+
     def _is_cat(col):
-        d = str(df[col].dtype)
+        d = str(net_df[col].dtype)
         return d == "object" or "string" in d or "large_string" in d
-    cat_cols = [c for c in df.columns if _is_cat(c)]
+    cat_cols = [c for c in net_df.columns if _is_cat(c)]
     if not cat_cols:
-        cat_cols = list(df.columns)
+        cat_cols = list(net_df.columns)
 
     def col_idx(candidates):
         for name in candidates:
             if name in cat_cols:
                 return cat_cols.index(name)
         return 0
-
-    st.markdown('<div class="sec-head">🔧 Network Configuration</div>', unsafe_allow_html=True)
 
     cfg1, cfg2, cfg3, cfg4, cfg5 = st.columns([2, 2, 1.8, 1.4, 1.4])
 
@@ -3018,7 +3588,8 @@ with tab_network:
     with cfg4:
         max_nodes = st.slider("Max nodes", 20, 400, 150)
     with cfg5:
-        min_edge  = st.slider("Min edge weight", 1, 10, 1,
+        min_edge  = st.slider("Min edge weight", 1, 10,
+                              2 if collusion_mode else 1,
                               help="Hide edges with fewer shared visits than this")
 
     net_height = st.slider("Canvas height (px)", 400, 900, 680, step=40)
@@ -3026,7 +3597,7 @@ with tab_network:
     # Quick preset combos
     st.markdown("""
 <div style='font-size:11px;color:#64748b;margin-bottom:14px;font-family:monospace'>
-  💡 Detect Collusion: <b style='color:#e2e8f0'>Practitioner Name ↔ Patient Name</b> (look for large clusters receiving same drugs) &nbsp;·&nbsp;
+  💡 Try: <b style='color:#e2e8f0'>Practitioner Name ↔ Patient Name</b> &nbsp;·&nbsp;
   <b style='color:#e2e8f0'>Practitioner Type ↔ Patient Type</b> &nbsp;·&nbsp;
   <b style='color:#e2e8f0'>Practitioner Name ↔ Gender</b> &nbsp;·&nbsp;
   <b style='color:#e2e8f0'>Practitioner Name ↔ Patient Type</b>
@@ -3035,20 +3606,20 @@ with tab_network:
     if col_a == col_b:
         st.warning("⚠️ Node A and Node B must be different columns.")
     else:
-        card_a = df[col_a].nunique()
-        card_b = df[col_b].nunique()
+        card_a = net_df[col_a].nunique()
+        card_b = net_df[col_b].nunique()
         st.markdown(
             f'<p style="font-size:12px;color:#64748b;font-family:monospace;margin-bottom:16px">'
             f'◆ <b style="color:#00e5a0">{col_a.replace("_"," ").title()}</b>: {card_a} unique values'
             f'&nbsp;|&nbsp;'
             f'● <b style="color:#0ea5e9">{col_b.replace("_"," ").title()}</b>: {card_b} unique values'
-            f'&nbsp;|&nbsp; {len(df):,} rows total</p>',
+            f'&nbsp;|&nbsp; {len(net_df):,} rows total</p>',
             unsafe_allow_html=True,
         )
 
         with st.spinner("Building network…"):
             vis_nodes, vis_edges, stats = build_network_data(
-                df, col_a, col_b, max_nodes, min_edge
+                net_df, col_a, col_b, max_nodes, min_edge
             )
 
         if vis_nodes is None:
@@ -3103,7 +3674,7 @@ with tab_network:
 # ══ CROSS-FACILITY FRAUD DETECTION TAB ═══════════════════════════════════════
 with tab_xfac:
   if not _dl_committed:
-    _render_tab_locked("Ghost Prescription Tracker")
+    _render_tab_locked("Cross-Facility Match")
   else:
     import math
 
@@ -3130,7 +3701,7 @@ with tab_xfac:
     st.markdown("""
 <div style='font-family:Syne,sans-serif;font-size:26px;font-weight:800;
      color:#e2e8f0;margin-bottom:4px'>
-  🔍 Ghost Prescription Tracker
+  🔍 Pharmacy Fraud Detection
 </div>
 <div style='color:#64748b;font-size:13px;margin-bottom:20px;font-family:monospace'>
   Identifies pharmacy claims where medicine was dispensed to patients
@@ -3353,9 +3924,10 @@ with tab_xfac:
         require_name=require_name,
     )
 
+    # Cache for the Verification Cards tab's Ghost Prescription queue
+    st.session_state["xfac_last_result"] = res_df
+
     no_rec    = res_df[res_df["status"]=="NO_RECORD"]
-    # Store ghost vids for the counter-verification tab
-    st.session_state["ghost_vids"] = no_rec["ph_voucher"].tolist()
     unlinked  = res_df[res_df["status"]=="UNLINKED"]
     matched   = res_df[res_df["status"]=="MATCHED"]
 
@@ -3374,10 +3946,10 @@ with tab_xfac:
     # Top KPI strip
     k1,k2,k3,k4,k5 = st.columns(5)
     k1.metric("Total pharmacy vouchers", f"{len(ph_work):,}")
-    k2.metric("✅ Verified (Legitimate journey found)",
+    k2.metric("✅ Verified (visit found)",
               f"{len(matched):,}",
               f"{100*len(matched)/len(ph_work):.1f}%")
-    k3.metric("🔴 Potential Ghost Prescriptions",
+    k3.metric("🔴 No facility record",
               f"{len(no_rec):,}",
               f"-{100*len(no_rec)/len(ph_work):.1f}%",
               delta_color="inverse")
@@ -3392,7 +3964,7 @@ with tab_xfac:
     # Insurance risk strip
     r1,r2,r3 = st.columns(3)
     r1.metric("Total RSSB claims (85%)",      f"RWF {total_ins:,.0f}")
-    r2.metric("🔴 Potential Ghost Prescriptions", f"RWF {no_rec_ins:,.0f}",
+    r2.metric("🔴 At-risk amount (no record)", f"RWF {no_rec_ins:,.0f}",
               f"{100*no_rec_ins/total_ins:.1f}% of total",
               delta_color="inverse")
     r3.metric("🟡 Partially unlinked",         f"RWF {unlinked_ins:,.0f}",
@@ -3450,22 +4022,6 @@ with tab_xfac:
   </div>
 </div>""", unsafe_allow_html=True)
 
-    if st.button("🚀 Push Potential Ghost Prescriptions to Verification Dashboard", key="push_ghost"):
-        pushed_count = 0
-        for _, row in no_rec.iterrows():
-            vid = str(row["ph_voucher"])
-            if vid and vid not in st.session_state["verifications"]:
-                st.session_state["verifications"][vid] = {
-                    "status": "Pending",
-                    "deduction": 0.0,
-                    "reason": "Flagged as Potential Ghost Prescription (No Hospital Visit)"
-                }
-                pushed_count += 1
-        if pushed_count > 0:
-            st.success(f"✅ Pushed {pushed_count} potential ghost prescriptions to Verification Dashboard!")
-        else:
-            st.info("ℹ️ All cases already in Verification Dashboard.")
-
     if not no_rec.empty:
         # Sub-controls
         t1c1, t1c2, t1c3 = st.columns([2,1.5,1.5])
@@ -3495,10 +4051,9 @@ with tab_xfac:
             "ph_voucher","ph_patient","ph_rama","ph_date",
             "ph_ins","ph_total","ph_doctor","ph_dept"
         ]].copy()
-        t1_show["Pushed"] = t1_show["ph_voucher"].astype(str).apply(lambda x: "✅" if x in st.session_state["verifications"] else "❌")
         t1_show.columns = [
             "Pharmacy Voucher","Patient Name","RAMA Number","Dispensing Date",
-            "Insurance Claim (RWF)","Total Cost (RWF)","Prescriber","Specialty", "Pushed"
+            "Insurance Claim (RWF)","Total Cost (RWF)","Prescriber","Specialty"
         ]
         t1_show["Dispensing Date"] = pd.to_datetime(
             t1_show["Dispensing Date"], errors="coerce"
@@ -3529,8 +4084,8 @@ with tab_xfac:
         _t1_xl["ph_date"] = pd.to_datetime(_t1_xl["ph_date"], errors="coerce").dt.strftime("%d/%m/%Y")
         with pd.ExcelWriter(t1_buf, engine="openpyxl") as xw:
             from openpyxl.styles import PatternFill as _PF, Font as _F, Alignment as _Al
-            _t1_xl.to_excel(xw, index=False, sheet_name="Potential Ghost Prescription (No Visit)")
-            ws = xw.sheets["Potential Ghost Prescription (No Visit)"]
+            _t1_xl.to_excel(xw, index=False, sheet_name="No Facility Record")
+            ws = xw.sheets["No Facility Record"]
             hf = _PF("solid", fgColor="7F1D1D")
             for cell in ws[1]:
                 cell.fill = hf
@@ -3711,11 +4266,11 @@ with tab_xfac:
             ("Total Pharmacy Vouchers", len(ph_work)),
             ("Facilities Loaded", fac_count),
             ("", ""),
-            ("✅ Verified (Legitimate journey found)", len(matched)),
+            ("✅ Verified (visit found)", len(matched)),
             ("   % of vouchers", f"{100*len(matched)/len(ph_work):.1f}%"),
             ("   Insurance amount (RWF)", matched_ins),
             ("", ""),
-            ("🔴 Potential Ghost Prescription (No Visit)", len(no_rec)),
+            ("🔴 No Facility Record", len(no_rec)),
             ("   % of vouchers", f"{100*len(no_rec)/len(ph_work):.1f}%"),
             ("   Insurance at risk (RWF)", no_rec_ins),
             ("", ""),
@@ -3745,7 +4300,7 @@ with tab_xfac:
         t1_xl = no_rec[["ph_voucher","ph_patient","ph_rama","ph_date","ph_ins","ph_total","ph_doctor","ph_dept"]].copy()
         t1_xl.columns = ["Voucher","Patient Name","RAMA Number","Dispensing Date","Insurance (RWF)","Total Cost (RWF)","Prescriber","Specialty"]
         t1_xl["Dispensing Date"] = _fmt_date(t1_xl["Dispensing Date"])
-        _make_sheet(wb, "1 - Potential Ghost Prescription (No Visit)", t1_xl, "7F1D1D", ["FFE4E4","FFFFFF"])
+        _make_sheet(wb, "1 - No Facility Record", t1_xl, "7F1D1D", ["FFE4E4","FFFFFF"])
 
         # Sheet 2: Unlinked
         t2_xl = unlinked[["ph_voucher","ph_patient","ph_rama","ph_date","ph_ins","fac_name","fac_date","fac_source","days_apart","name_score"]].copy()
@@ -3775,238 +4330,402 @@ with tab_xfac:
 # ══ COUNTER-VERIFICATION REPORT TAB ══════════════════════════════════════════
 with tab_cv:
   if not _dl_committed:
-    _render_tab_locked("Counter-Verification")
+    _render_tab_locked("Counter-Verification Report")
   else:
-    st.markdown('<div class="sec-head">📄 Interactive Counter-Verification Dashboard</div>',
+    st.markdown('<div class="sec-head">📄 Counter-Verification Report Generator</div>',
                 unsafe_allow_html=True)
 
-    total_deds = sum(v.get("deduction", 0) for v in st.session_state["verifications"].values())
-    st.metric("Total Current Deductions", f"{total_deds:,.0f} RWF")
+    st.markdown("""
+<div class="info-banner">
+  <b>How it works:</b><br>
+  Upload the annotated voucher file — the same invoice report with two extra columns
+  added by the verifier: <b style='color:#00e5a0'>Difference</b> (deduction amount in RWF)
+  and <b style='color:#00e5a0'>Observation</b> (reason for deduction). Rows without a
+  deduction are simply left blank in those columns.<br><br>
+  The app reads those columns, matches records by Paper Code, and generates the
+  official two-sheet counter-verification Excel report automatically.
+</div>""", unsafe_allow_html=True)
 
-    # ── Sidebar-like controls inside the tab ──
-    c1, c2, c3 = st.columns([2, 2, 1])
-    with c1:
-        search_q = st.text_input("🔍 Search by Paper Code, Patient, or RAMA", key="cv_search")
-    with c2:
-        queue_filter = st.selectbox("🎯 Verification Queues",
-            ["All Claims", "High-Cost/High-Frequency Queue", "Repeat Visit Queue", "Potential Ghost Prescriptions"],
-            key="cv_queue_filter")
-    with c3:
-        status_filter = st.selectbox("Filter by Status", ["All", "Pending", "Verified", "Deducted", "Ghost Prescription", "Signature Mismatch"], key="cv_status_filter")
+    # ── STEP 1 — Upload annotated file ────────────────────────────────────
+    st.markdown('<div class="sec-head">📂 Step 1 — Upload Annotated Voucher File</div>',
+                unsafe_allow_html=True)
 
-    # ── Filter Logic ──
-    cv_df = df.copy()
+    cv_upload = st.file_uploader(
+        "Upload annotated file (Excel / CSV)",
+        type=["xlsx", "xls", "csv"],
+        key="cv_upload",
+        help="Must be the invoice report with Difference and Observation columns filled in for deducted rows.",
+    )
 
-    # Apply Queue Filters
-    if queue_filter == "High-Cost/High-Frequency Queue":
-        expensive_drugs = ["crestor", "galvus", "keppra"] # As per prompt
-        pattern = "|".join(expensive_drugs)
-        mask = cv_df["drug_name"].str.lower().str.contains(pattern, na=False) if "drug_name" in cv_df.columns else pd.Series(False, index=cv_df.index)
-        # Also high cost (e.g. > 50,000 RWF - arbitrary but reasonable)
-        high_cost = cv_df["amount"] > 50000 if "amount" in cv_df.columns else pd.Series(False, index=cv_df.index)
-        cv_df = cv_df[mask | high_cost]
-    elif queue_filter == "Repeat Visit Queue":
-        # Patients with > 1 visit in a month
-        if "patient_id" in cv_df.columns and "visit_date" in cv_df.columns:
-            cv_df["month"] = cv_df["visit_date"].dt.to_period("M")
-            repeat_mask = cv_df.groupby(["patient_id", "month"])["patient_id"].transform("count") > 1
-            cv_df = cv_df[repeat_mask]
-    elif queue_filter == "Potential Ghost Prescriptions":
-        ghost_vids = st.session_state.get("ghost_vids", [])
-        if "voucher_id" in cv_df.columns:
-            cv_df = cv_df[cv_df["voucher_id"].isin(ghost_vids)]
+    # ── Parse uploaded file ────────────────────────────────────────────────
+    ann_df = None
+    deduction_list = []
 
-    # Search filter
-    if search_q:
-        search_cols = ["voucher_id", "patient_name", "patient_id"]
-        search_mask = pd.Series(False, index=cv_df.index)
-        for col in search_cols:
-            if col in cv_df.columns:
-                search_mask |= cv_df[col].astype(str).str.contains(search_q, case=False, na=False)
-        cv_df = cv_df[search_mask]
-
-    # Status filter
-    if status_filter != "All":
-        def get_status(vid):
-            return st.session_state["verifications"].get(vid, {}).get("status", "Pending")
-        if "voucher_id" in cv_df.columns:
-            cv_df = cv_df[cv_df["voucher_id"].apply(get_status) == status_filter]
-
-    # ── Render Cards ──
-    if st.button("🗑️ Clear All Verifications", type="secondary"):
-        st.session_state["verifications"] = {}
-        st.rerun()
-    st.markdown(f"Showing **{len(cv_df)}** records")
-
-    # Pagination (simple)
-    batch_size = 12
-    num_pages = (len(cv_df) // batch_size) + 1
-    if num_pages > 1:
-        page = st.number_input("Page", 1, num_pages, 1)
-    else:
-        page = 1
-
-    start_idx = (page - 1) * batch_size
-    end_idx = start_idx + batch_size
-
-    batch = cv_df.iloc[start_idx:end_idx]
-
-    for i, row in batch.iterrows():
-        vid = str(row.get("voucher_id", i))
-        v_data = st.session_state["verifications"].get(vid, {"status": "Pending", "deduction": 0.0, "reason": ""})
-
-        with st.container():
-            col_info, col_action = st.columns([3, 2])
-
-            with col_info:
-                st.markdown(f"""
-<div style='background:#111720;border:1px solid #1e2a38;border-radius:12px;padding:16px;margin-bottom:10px'>
-  <div style='display:flex;justify-content:space-between'>
-    <b style='color:#00e5a0;font-size:16px'>{row.get('patient_name', 'Unknown')}</b>
-    <span style='color:#64748b;font-family:monospace'>{row.get('voucher_id', 'No Code')}</span>
-  </div>
-  <div style='margin-top:8px;font-size:13px'>
-    <span style='color:#94a3b8'>RAMA:</span> {row.get('patient_id', '—')} |
-    <span style='color:#94a3b8'>Date:</span> {row.get('visit_date', '—').strftime('%d/%m/%Y') if hasattr(row.get('visit_date'), 'strftime') else '—'}
-  </div>
-  <div style='margin-top:4px;font-size:13px'>
-    <span style='color:#94a3b8'>Practitioner:</span> {row.get('doctor_name', '—')}
-  </div>
-  <div style='margin-top:8px;font-weight:bold;color:#e2e8f0'>
-    Total: {row.get('amount', 0):,.0f} RWF | Insurance: {row.get('insurance_copay', 0):,.0f} RWF
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-            with col_action:
-                st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-                new_status = st.selectbox("Status",
-                    ["Pending", "Verified", "Deducted", "Ghost Prescription", "Signature Mismatch"],
-                    index=["Pending", "Verified", "Deducted", "Ghost Prescription", "Signature Mismatch"].index(v_data["status"]),
-                    key=f"status_{vid}")
-
-                new_deduction = st.number_input("Deduction (RWF)",
-                    min_value=0.0,
-                    max_value=float(row.get('amount', 9999999)),
-                    value=float(v_data["deduction"]),
-                    key=f"ded_{vid}")
-
-                new_reason = st.text_input("Reason / Comments",
-                    value=v_data["reason"],
-                    placeholder="e.g. Quantity exceeds RSSB limit",
-                    key=f"reason_{vid}")
-
-                if new_status != v_data["status"] or new_deduction != v_data["deduction"] or new_reason != v_data["reason"]:
-                    st.session_state["verifications"][vid] = {
-                        "status": new_status,
-                        "deduction": new_deduction,
-                        "reason": new_reason
-                    }
-
-    # ── Draft Sheet ──
-    st.markdown('<div class="sec-head">📋 Draft Sheet (Processed Vouchers)</div>', unsafe_allow_html=True)
-
-    draft_data = []
-    for vid, data in st.session_state["verifications"].items():
-        if data["status"] != "Pending":
-            # Find row in original df
-            if "voucher_id" in df.columns:
-                r = df[df["voucher_id"] == vid]
-                if not r.empty:
-                    row = r.iloc[0]
-                    draft_data.append({
-                        "Paper Code": vid,
-                        "Patient": row.get("patient_name", "—"),
-                        "RAMA": row.get("patient_id", "—"),
-                        "Status": data["status"],
-                        "Deduction": data["deduction"],
-                        "Reason": data["reason"]
-                    })
-
-    if draft_data:
-        st.dataframe(pd.DataFrame(draft_data), use_container_width=True)
-    else:
-        st.info("No vouchers processed yet.")
-
-    # ── Report Generation Section ──
-    st.markdown('<div class="sec-head">⚙️ Final Report Metadata</div>', unsafe_allow_html=True)
-    mc1, mc2 = st.columns(2)
-    with mc1:
-        cv_province = st.text_input("Province", value="KIGALI CITY", key="cv_prov")
-        cv_district = st.text_input("District", value="NYARUGENGE", key="cv_dist")
-        cv_pharmacy = st.text_input("Pharmacy Name", value=_dl.get("filename", "").split(".")[0], key="cv_pharm")
-    with mc2:
-        if "date_min" in s and "date_max" in s:
-            default_period = f"{s['date_min']} to {s['date_max']}"
-        else:
-            default_period = ""
-        cv_period = st.text_input("Period", value=default_period, key="cv_per")
-        cv_prep = st.text_input("Prepared by", value="", key="cv_prep")
-        cv_verified = st.text_input("Verified by", value="Alphonsine MUKAKAYIBANDA", key="cv_verif")
-
-    if st.button("🚀 Generate Final RSSB Report", type="primary"):
-        # Build deduction_list from st.session_state["verifications"]
-        final_deductions = []
-        # We need a copy of the df with the added Difference and Observation columns for the first sheet
-        report_df = df.copy()
-        report_df["Difference"] = 0.0
-        report_df["Observation"] = ""
-
-        for vid, data in st.session_state["verifications"].items():
-            if data["status"] != "Pending" and data["deduction"] > 0:
-                # Find the row
-                idx = report_df[report_df["voucher_id"] == vid].index
-                if not idx.empty:
-                    report_df.loc[idx, "Difference"] = -abs(data["deduction"])
-                    report_df.loc[idx, "Observation"] = data["reason"]
-
-                    row = report_df.loc[idx[0]]
-                    final_deductions.append({
-                        "paper_code": vid,
-                        "rama_no": row.get("patient_id", "—"),
-                        "patient": row.get("patient_name", "—"),
-                        "amount": -abs(data["deduction"]),
-                        "explanation": data["reason"],
-                        "ins_copay": row.get("insurance_copay", 0.0),
-                        "total_cost": row.get("amount", 0.0)
-                    })
-
-        meta = {
-            "province": cv_province,
-            "district": cv_district,
-            "pharmacy": cv_pharmacy,
-            "period":   cv_period,
-            "code":     "",
-        }
-
+    if cv_upload is not None:
         try:
-            xlsx_bytes = generate_counter_verification_xlsx(
-                df          = report_df,
-                deductions  = final_deductions,
-                meta        = meta,
-                prepared_by = cv_prep,
-                verified_by = cv_verified,
-                approved_by = "",
-                pc_col      = "voucher_id",
-                ins_col     = "insurance_copay",
-                tot_col     = "amount",
-                obs_col     = "Observation",
-                dif_col     = "Difference",
-            )
-            st.session_state["cv_xlsx"] = xlsx_bytes
-            st.session_state["cv_generated"] = True
-            st.success("✅ Final Report Generated!")
+            raw_bytes = cv_upload.read()
+            fname = cv_upload.name.lower()
+            if fname.endswith(".csv"):
+                raw_ann = pd.read_csv(io.BytesIO(raw_bytes), encoding="utf-8",
+                                      on_bad_lines="skip")
+            else:
+                # Try each sheet — prefer one named Sheet1, or the one with most rows
+                xl_ann = pd.ExcelFile(io.BytesIO(raw_bytes))
+                sheet_candidates = []
+                for sn in xl_ann.sheet_names:
+                    try:
+                        tmp = xl_ann.parse(sn, header=0)
+                        sheet_candidates.append((sn, tmp))
+                    except Exception:
+                        pass
+
+                # Prefer sheet whose columns contain "difference" or "observation"
+                # AND whose difference column contains meaningful deduction amounts
+                # (not just tiny rounding artifacts < 100 RWF).
+                def score_sheet(df_):
+                    cols = " ".join(df_.columns.astype(str).str.lower())
+                    if not ("diff" in cols or "observ" in cols or "remark" in cols):
+                        return False
+                    # Validate: difference column must have at least one value > 100
+                    # to distinguish real deductions from rounding artifacts
+                    for col in df_.columns:
+                        if re.search(r"diff|deduct|deduit", str(col).lower()):
+                            vals = pd.to_numeric(df_[col], errors="coerce").dropna()
+                            if len(vals) > 0 and vals.abs().max() > 100:
+                                return True
+                    # Has "observ"/"remark" column but no meaningful difference values —
+                    # could still be a valid annotated sheet if observation is non-empty
+                    for col in df_.columns:
+                        if re.search(r"observ|remark|reason|explan", str(col).lower()):
+                            non_blank = df_[col].dropna()
+                            non_blank = non_blank[non_blank.astype(str).str.strip() != ""]
+                            if len(non_blank) > 0:
+                                return True
+                    return False
+
+                preferred = next(
+                    ((sn, d) for sn, d in sheet_candidates if score_sheet(d)),
+                    None
+                )
+                # If no sheet passed validation, fall back to largest sheet by row count
+                if preferred is None:
+                    preferred = max(sheet_candidates, key=lambda x: len(x[1]),
+                                    default=(None, None))
+                chosen_sheet, raw_ann = preferred
+
+            # ── Auto-detect columns ──────────────────────────────────────
+            def _normalise_col(c):
+                import re as _re
+                return _re.sub(r"[^a-z0-9]", "_",
+                               str(c).lower().strip()).strip("_")
+
+            col_norm = {_normalise_col(c): c for c in raw_ann.columns}
+
+            def _find_col(patterns):
+                for pat in patterns:
+                    for norm, orig in col_norm.items():
+                        if re.search(pat, norm):
+                            return orig
+                return None
+
+            detected = {
+                "paper_code":  _find_col([r"paper_?code", r"voucher_?no", r"invoice_?no",
+                                          r"invoice_?id", r"id_?invoice", r"claim_?no",
+                                          r"ref_?no", r"receipt_?no", r"doc_?no"]),
+                "rama":        _find_col([r"rama", r"affil", r"member", r"benef"]),
+                "patient":     _find_col([r"patient_?name", r"beneficiary_?name",
+                                          r"client_?name", r"nom"]),
+                "difference":  _find_col([r"diff", r"deduct", r"deduit", r"montant_ded",
+                                          r"amount_ded", r"ded_amount"]),
+                "observation": _find_col([r"observ", r"remark", r"reason", r"explan",
+                                          r"comment", r"note", r"justif", r"motif"]),
+                "ins_copay":   _find_col([r"insurance_co", r"ins_cop", r"couverture",
+                                          r"rama_amount"]),
+                "total_cost":  _find_col([r"total_cost", r"total", r"amount", r"cout"]),
+                "visit_date":  _find_col([r"dispensing", r"visit_date", r"date"]),
+                "doctor":      _find_col([r"practitioner", r"prescriber", r"doctor",
+                                          r"medecin"]),
+            }
+
+            # ── Warn if file looks like a raw (un-annotated) voucher report ──
+            _diff_col = detected.get("difference")
+            _obs_col  = detected.get("observation")
+            _has_real_diffs = False
+            _has_real_obs   = False
+            if _diff_col and _diff_col in raw_ann.columns:
+                _diff_vals = pd.to_numeric(raw_ann[_diff_col], errors="coerce").dropna()
+                _has_real_diffs = len(_diff_vals) > 0 and _diff_vals.abs().max() > 100
+            if _obs_col and _obs_col in raw_ann.columns:
+                _obs_vals = raw_ann[_obs_col].dropna()
+                _obs_vals = _obs_vals[_obs_vals.astype(str).str.strip() != ""]
+                _has_real_obs = len(_obs_vals) > 0
+
+            if not _diff_col and not _obs_col:
+                st.warning(
+                    "⚠️ No **Difference** or **Observation** columns detected in this file. "
+                    "This looks like a raw voucher report that hasn't been annotated yet. "
+                    "Please add a **Difference** column (deduction amount in RWF) and an "
+                    "**Observation** column (reason for deduction) to each deducted row, "
+                    "then re-upload."
+                )
+            elif _diff_col and not _has_real_diffs:
+                st.warning(
+                    f"⚠️ The detected **Difference** column (*{_diff_col}*) contains only "
+                    f"very small values (< 100 RWF). This is likely a rounding artifact, "
+                    f"not real counter-verification deductions. "
+                    f"Please fill in the actual deduction amounts (e.g. 20,000 RWF) "
+                    f"in that column before generating the report."
+                )
+            if _diff_col and _has_real_diffs and not _has_real_obs:
+                st.warning(
+                    f"⚠️ The **Observation** column (*{_obs_col or 'not found'}*) is empty. "
+                    f"No deduction reasons will appear in the report. "
+                    f"Please fill in the reason for each deduction."
+                )
+
+            st.session_state["ann_df"]       = raw_ann
+            st.session_state["ann_detected"] = detected
+
         except Exception as e:
-            st.error(f"❌ Failed to generate report: {e}")
+            st.error(f"❌ Could not read file: {e}")
             import traceback; st.code(traceback.format_exc())
 
-    if st.session_state.get("cv_generated"):
-        st.download_button(
-            label="⬇️ Download Final RSSB Report (.xlsx)",
-            data=st.session_state["cv_xlsx"],
-            file_name=f"RSSB_FINAL_{cv_pharmacy}_{cv_period}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    # Load from session state if already uploaded
+    if "ann_df" in st.session_state:
+        raw_ann  = st.session_state["ann_df"]
+        detected = st.session_state["ann_detected"]
+
+        # ── STEP 2 — Confirm / override column mapping ─────────────────────
+        st.markdown('<div class="sec-head">🔗 Step 2 — Confirm Column Mapping</div>',
+                    unsafe_allow_html=True)
+        st.markdown("""
+<div style='font-size:11px;color:#64748b;margin-bottom:10px;font-family:monospace'>
+  Columns detected automatically. Correct any mismatches — only
+  <b style='color:#e2e8f0'>Paper Code</b>, <b style='color:#e2e8f0'>Difference</b>
+  and <b style='color:#e2e8f0'>Observation</b> are required.
+</div>""", unsafe_allow_html=True)
+
+        col_opts = ["(none)"] + raw_ann.columns.tolist()
+        def _sel_idx(col_name):
+            return col_opts.index(col_name) if col_name in col_opts else 0
+
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            sel_pc  = st.selectbox("📄 Paper Code",
+                                   col_opts, index=_sel_idx(detected["paper_code"]),
+                                   key="cv_sel_pc")
+            sel_obs = st.selectbox("💬 Observation / Reason",
+                                   col_opts, index=_sel_idx(detected["observation"]),
+                                   key="cv_sel_obs")
+        with cc2:
+            sel_dif = st.selectbox("💰 Difference (amount deducted)",
+                                   col_opts, index=_sel_idx(detected["difference"]),
+                                   key="cv_sel_dif")
+            sel_ins = st.selectbox("🏥 Insurance Co-payment",
+                                   col_opts, index=_sel_idx(detected["ins_copay"]),
+                                   key="cv_sel_ins")
+        with cc3:
+            sel_tot = st.selectbox("💵 Total Cost",
+                                   col_opts, index=_sel_idx(detected["total_cost"]),
+                                   key="cv_sel_tot")
+            sel_pat = st.selectbox("👤 Patient Name",
+                                   col_opts, index=_sel_idx(detected["patient"]),
+                                   key="cv_sel_pat")
+
+        # Preview
+        with st.expander("🔍 Preview uploaded file", expanded=False):
+            st.dataframe(raw_ann.head(30), use_container_width=True, height=280)
+
+        # ── Build deduction list ─────────────────────────────────────────
+        if sel_pc != "(none)" and sel_dif != "(none)":
+
+            def _to_float(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return 0.0
+                try:
+                    return float(str(v).replace(",", "").replace(" ", ""))
+                except ValueError:
+                    return 0.0
+
+            ann_work = raw_ann.copy()
+            ann_work["_pc"]  = ann_work[sel_pc].astype(str).str.strip()
+            ann_work["_dif"] = ann_work[sel_dif].apply(_to_float)
+            ann_work["_obs"] = (ann_work[sel_obs].fillna("").astype(str).str.strip()
+                                if sel_obs != "(none)" else "")
+            ann_work["_ins"] = (ann_work[sel_ins].apply(_to_float)
+                                if sel_ins != "(none)" else 0.0)
+            ann_work["_tot"] = (ann_work[sel_tot].apply(_to_float)
+                                if sel_tot != "(none)" else 0.0)
+            ann_work["_pat"] = (ann_work[sel_pat].fillna("").astype(str).str.strip()
+                                if sel_pat != "(none)" else "")
+
+            # Identify real deduction rows.
+            # Handles both sign conventions (positive or negative = deducted).
+            # Keeps a row when EITHER:
+            #   • |difference| >= 100 RWF  (meaningful amount even if no note), OR
+            #   • observation is non-blank  (annotated by verifier, even if small)
+            # This discards sub-100-RWF rounding artifacts that have no annotation.
+            _has_obs   = ann_work["_obs"].str.strip() != ""
+            _big_amt   = ann_work["_dif"].abs() >= 100
+            deducted_rows = ann_work[_big_amt | _has_obs].copy()
+
+            # Pull RAMA from main loaded df if possible
+            rama_lookup = {}
+            vid_main = "voucher_id" if "voucher_id" in df.columns else None
+            pid_main = "patient_id" if "patient_id" in df.columns else None
+            if vid_main and pid_main:
+                for _, r in df[[vid_main, pid_main]].iterrows():
+                    rama_lookup[str(r[vid_main]).strip()] = str(r[pid_main]).strip()
+
+            deduction_list = []
+            for _, r in deducted_rows.iterrows():
+                pc   = r["_pc"]
+                rama = rama_lookup.get(pc, "—")
+                deduction_list.append({
+                    "paper_code":  pc,
+                    "rama_no":     rama,
+                    "patient":     r["_pat"],
+                    "amount":      -abs(r["_dif"]),  # always negative regardless of source sign
+                    "explanation": r["_obs"],
+                    "ins_copay":   r["_ins"],
+                    "total_cost":  r["_tot"],
+                })
+
+            # ── STEP 3 — Deduction summary ─────────────────────────────
+            st.markdown('<div class="sec-head">📊 Step 3 — Deduction Summary</div>',
+                        unsafe_allow_html=True)
+
+            total_ded    = sum(d["amount"]   for d in deduction_list)
+            total_ins    = ann_work["_ins"].sum() if sel_ins != "(none)" else 0
+            net_payable  = total_ins - total_ded
+
+            sm1, sm2, sm3, sm4 = st.columns(4)
+            sm1.metric("Rows with deductions",    f"{len(deduction_list):,}")
+            sm2.metric("Total deducted (RWF)",    f"{total_ded:,.0f}")
+            sm3.metric("Total insurance claims",  f"{total_ins:,.0f}")
+            sm4.metric("Net payable (RWF)",       f"{net_payable:,.0f}")
+
+            # Observation breakdown
+            obs_counts = {}
+            for d in deduction_list:
+                key = d["explanation"].strip().lower()
+                obs_counts[key] = obs_counts.get(key, 0) + 1
+            if obs_counts:
+                st.markdown("""
+<div style='font-size:11px;color:#64748b;font-family:monospace;margin:8px 0 4px'>
+  <b style='color:#e2e8f0'>Deduction reasons breakdown:</b>
+</div>""", unsafe_allow_html=True)
+                reason_cols = st.columns(min(len(obs_counts), 4))
+                for i, (reason, cnt) in enumerate(
+                        sorted(obs_counts.items(), key=lambda x: -x[1])):
+                    reason_cols[i % len(reason_cols)].metric(
+                        reason[:40] or "(blank)", cnt)
+
+            # Deduction table
+            ded_tbl = pd.DataFrame([{
+                "#":             i + 1,
+                "Paper Code":    d["paper_code"],
+                "Patient":       d["patient"],
+                "RAMA No.":      d["rama_no"],
+                "Ins. Co-pay":   d["ins_copay"],
+                "Deducted (RWF)":d["amount"],
+                "Observation":   d["explanation"],
+            } for i, d in enumerate(deduction_list)])
+            st.dataframe(ded_tbl, use_container_width=True, height=320)
+
+        else:
+            st.info("👆 Assign at least the **Paper Code** and **Difference** columns above to continue.")
+
+        # ── STEP 4 — Report metadata ───────────────────────────────────────
+        if deduction_list:
+            st.markdown('<div class="sec-head">📋 Step 4 — Report Metadata</div>',
+                        unsafe_allow_html=True)
+
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                cv_province = st.text_input("Province",                value="WESTERN PROVINCE", key="cv_prov")
+                cv_district = st.text_input("Administrative District", value="RUBAVU",            key="cv_dist")
+                cv_pharmacy = st.text_input("Pharmacy",
+                    value="PHARMACIE VINCA GISENYI LTD", key="cv_pharm")
+            with mc2:
+                if "date_min" in s and "date_max" in s:
+                    default_period = f"{s['date_min']} to {s['date_max']}"
+                else:
+                    default_period = ""
+                cv_period  = st.text_input("Period",          value=default_period, key="cv_per")
+                cv_code    = st.text_input("Code",            value="",             key="cv_code")
+                cv_prep    = st.text_input("Prepared by",     value="",             key="cv_prep")
+
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                cv_verified = st.text_input("Verified by",
+                    value="Alphonsine MUKAKAYIBANDA", key="cv_verif")
+            with sc2:
+                cv_approved = st.text_input("Approved by", value="", key="cv_approv")
+
+            # ── STEP 5 — Generate ──────────────────────────────────────────
+            st.markdown('<div class="sec-head">⬇️ Step 5 — Generate Report</div>',
+                        unsafe_allow_html=True)
+
+            if st.button("📊 Generate Counter-Verification Excel Report",
+                         type="primary", key="cv_gen_btn"):
+                meta = {
+                    "province": cv_province,
+                    "district": cv_district,
+                    "pharmacy": cv_pharmacy,
+                    "period":   cv_period,
+                    "code":     cv_code,
+                }
+
+                # Merge annotated file into df for Sheet1 (use uploaded file rows)
+                # Build a combined df from ann_work so we have Difference + Observation
+                ann_for_report = ann_work.copy()
+
+                with st.spinner("Building Excel report…"):
+                    try:
+                        xlsx_bytes = generate_counter_verification_xlsx(
+                            df          = ann_for_report,
+                            deductions  = deduction_list,
+                            meta        = meta,
+                            prepared_by = cv_prep,
+                            verified_by = cv_verified,
+                            approved_by = cv_approved,
+                            pc_col      = sel_pc,
+                            ins_col     = sel_ins if sel_ins != "(none)" else None,
+                            tot_col     = sel_tot if sel_tot != "(none)" else None,
+                            obs_col     = sel_obs if sel_obs != "(none)" else None,
+                            dif_col     = sel_dif,
+                        )
+                        st.session_state["cv_xlsx"]      = xlsx_bytes
+                        st.session_state["cv_generated"] = True
+                        st.session_state["cv_fname_meta"] = (cv_pharmacy, cv_period)
+                    except Exception as e:
+                        st.error(f"❌ Failed to generate report: {e}")
+                        import traceback; st.code(traceback.format_exc())
+
+            if st.session_state.get("cv_generated"):
+                pharm_s, period_s = st.session_state.get("cv_fname_meta", ("pharmacy", "period"))
+                fname = (f"counter_verification_"
+                         f"{pharm_s.replace(' ','_')[:25]}_"
+                         f"{period_s.replace(' ','_').replace('/','')[:15]}.xlsx")
+                st.success("✅ Report ready!")
+                st.download_button(
+                    label     = "⬇️ Download Counter-Verification Report (.xlsx)",
+                    data      = st.session_state["cv_xlsx"],
+                    file_name = fname,
+                    mime      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key       = "cv_download",
+                )
+                st.markdown("""
+<div style='font-size:12px;color:#64748b;font-family:monospace;margin-top:8px'>
+  <b style='color:#e2e8f0'>Sheet 1</b> — "After counter verification":
+  full records table with 100% and 85% columns; deducted rows highlighted in amber.<br>
+  <b style='color:#e2e8f0'>Sheet 2</b> — "Counter verification report":
+  official summary with deduction list, totals, and signature block.
+</div>""", unsafe_allow_html=True)
+
+    else:
+        st.info("👆 Upload your annotated voucher file to get started.")
 
 # ══ DATA PREP TAB ════════════════════════════════════════════════════════════
 with tab_dataprep:
@@ -4152,7 +4871,7 @@ with tab_dataprep:
             _qual_rows.append({
                 "Column": str(_c)[:40],
                 "Type": str(_s_col.dtype),
-                "Fill_Pct": f"{100-_null_pct:.0f}%",
+                "Fill %": f"{100-_null_pct:.0f}%",
                 "Unique": _uniq,
                 "Sample values": _samples,
             })
@@ -4166,12 +4885,9 @@ with tab_dataprep:
                 return "color:#ef4444;font-weight:bold"
             except Exception:
                 return ""
-        if _qual_df.empty:
-            st.warning("No columns detected in the uploaded file.")
-            st.stop()
 
         st.dataframe(
-            _qual_df.style.map(_color_fill, subset=["Fill_Pct"]),
+            _qual_df.style.map(_color_fill, subset=["Fill %"]),
             use_container_width=True, height=280,
         )
 
@@ -4761,7 +5477,6 @@ with tab_dataprep:
                         "committed_at":   _dt.now().strftime("%d/%m/%Y %H:%M"),
                         "source_rows":    len(_final_df),
                     }
-                    st.session_state["verifications"] = {}
                     st.success(
                         f"✅ Data lake committed! "
                         f"**{len(_lake_df):,} rows** · **{len(_confirmed_map)} system fields** · "

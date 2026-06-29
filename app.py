@@ -2527,6 +2527,7 @@ def generate_rssb_final_xlsx(
     rama_col = "patient_id" if "patient_id" in df.columns else None
     doc_col  = "doctor_name" if "doctor_name" in df.columns else None
     date_col = "visit_date" if "visit_date" in df.columns else None
+    fac_col  = "facility" if "facility" in df.columns else None
     tot_col  = "amount" if "amount" in df.columns else None
     ins_col  = "insurance_copay" if "insurance_copay" in df.columns else None
     med_col  = "medicine_cost" if "medicine_cost" in df.columns else None
@@ -2545,12 +2546,12 @@ def generate_rssb_final_xlsx(
     ws.freeze_panes = "A2"
 
     headers = [
-        "Paper Code", "Dispensing Date", "Patient Name", "RAMA Number",
+        "Paper Code", "Health Facility", "Dispensing Date", "Patient Name", "RAMA Number",
         "Practitioner Name", "Status", "Total Cost (RWF)",
         "Insurance Co-payment (RWF)", "Medicine Cost (RWF)",
         "100% after cv", "85% after cv", "difference", "Reason",
     ]
-    widths = [14, 16, 22, 22, 26, 16, 16, 18, 16, 16, 16, 14, 30]
+    widths = [14, 26, 16, 22, 22, 26, 16, 16, 18, 16, 16, 16, 14, 30]
     for ci, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
 
@@ -2571,6 +2572,19 @@ def generate_rssb_final_xlsx(
         deduction = float(dec.get("deduction", 0) or 0)
         reason = dec.get("reason", "")
 
+        # Apply missing-data corrections recorded during card review — only
+        # used when the original file's value is blank, never overwrites
+        # real data.
+        facility_val = str(row.get(fac_col, "")) if fac_col and pd.notna(row.get(fac_col)) else ""
+        if not facility_val:
+            facility_val = dec.get("facility_override", "")
+
+        date_val = row.get(date_col) if date_col else None
+        date_is_real = pd.notna(date_val) if date_col else False
+        date_override = dec.get("date_override", "")
+        if not date_is_real and date_override:
+            date_val = date_override  # stored/typed as plain text, not a real Timestamp
+
         total_cost = pd.to_numeric(row.get(tot_col), errors="coerce") if tot_col else 0
         total_cost = 0 if pd.isna(total_cost) else float(total_cost)
         ins_copay  = pd.to_numeric(row.get(ins_col), errors="coerce") if ins_col else 0
@@ -2590,7 +2604,8 @@ def generate_rssb_final_xlsx(
 
         vals = [
             pc_display,
-            row.get(date_col) if date_col else "",
+            facility_val,
+            date_val if date_is_real else (date_val or ""),
             str(row.get(pnm_col, "")) if pnm_col else "",
             str(row.get(rama_col, "")) if rama_col else "",
             str(row.get(doc_col, "")) if doc_col else "",
@@ -2603,20 +2618,27 @@ def generate_rssb_final_xlsx(
             c = ws.cell(ri, ci, v)
             c.border = border_all(THIN)
             c.fill = zebra
-            if ci == 2 and date_col:
+            if ci == 3 and date_col and date_is_real:
                 c.number_format = "dd/mm/yyyy"
                 c.alignment = A_C
-            elif ci == 6:
+            elif ci == 3:
+                c.alignment = A_C
+                if date_override:
+                    c.font = font(color=C_AMBER)  # flag manually-added date
+            elif ci == 2 and not str(row.get(fac_col, "")).strip() and facility_val:
+                c.alignment = A_L
+                c.font = font(color=C_AMBER)  # flag manually-added facility
+            elif ci == 7:
                 is_clean = status.lower() in ("verified",)
                 c.font = font(bold=True, color=(C_GREEN if is_clean else C_AMBER))
                 c.fill = fill(C_FILL_GREEN if is_clean else C_FILL_AMBER)
                 c.alignment = A_C
-            elif ci in (7, 8, 9, 10, 11, 12):
+            elif ci in (8, 9, 10, 11, 12, 13):
                 c.number_format = "#,##0.00"
                 c.alignment = A_R
-                if ci == 12 and diff:
+                if ci == 13 and diff:
                     c.font = font(color=C_RED)
-            elif ci == 13:
+            elif ci == 14:
                 c.alignment = A_L
             else:
                 c.alignment = A_L
@@ -2624,13 +2646,13 @@ def generate_rssb_final_xlsx(
 
     # Totals row
     tot_ri = ri
-    ws.cell(tot_ri, 6, "TOTAL")
-    for ci in range(1, 14):
+    ws.cell(tot_ri, 7, "TOTAL")
+    for ci in range(1, 15):
         c = ws.cell(tot_ri, ci)
         c.font = font(bold=True, color=C_WHITE)
         c.fill = fill(C_BLUE)
         c.border = Border(left=MED_B, right=MED_B, top=MED_G, bottom=MED_B)
-    for ci, col_letter in [(7, "G"), (8, "H"), (9, "I"), (10, "J"), (11, "K"), (12, "L")]:
+    for ci, col_letter in [(8, "H"), (9, "I"), (10, "J"), (11, "K"), (12, "L"), (13, "M")]:
         c = ws.cell(tot_ri, ci, f"=SUM({col_letter}2:{col_letter}{tot_ri-1})")
         c.number_format = "#,##0.00"
         c.alignment = A_R
@@ -3163,9 +3185,27 @@ with tab_verify:
         rama = str(row.get(rama_col, "—")) if rama_col else "—"
         doc  = str(row.get(doc_col, "—")) if doc_col else "—"
         doctp = str(row.get(doctp_col, "")) if doctp_col else ""
+
+        # Apply any previously-saved missing-data overrides for this row
+        date_override = existing.get("date_override", "")
+        facility_override = existing.get("facility_override", "")
+
         dt = row.get(date_col)
-        dt_str = pd.to_datetime(dt, errors="coerce").strftime("%d %b %Y") if date_col and pd.notna(dt) else "—"
-        facility = str(row.get(fac_col, "")) if fac_col and pd.notna(row.get(fac_col)) else ""
+        has_real_date = bool(date_col) and pd.notna(dt)
+        if has_real_date:
+            dt_str = pd.to_datetime(dt, errors="coerce").strftime("%d %b %Y")
+        elif date_override:
+            dt_str = date_override + "  ✏️"
+        else:
+            dt_str = "— missing"
+
+        facility_raw = str(row.get(fac_col, "")) if fac_col and pd.notna(row.get(fac_col)) else ""
+        if facility_raw:
+            facility = facility_raw
+        elif facility_override:
+            facility = facility_override + "  ✏️"
+        else:
+            facility = ""
 
         tag, tag_cls = "", ""
         if pc_display in ghost_vouchers:
@@ -3192,8 +3232,17 @@ with tab_verify:
   🏥 <b style='color:#e2e8f0'>{facility}</b>
   <span class='vcd-badge' style='margin-left:8px'>System Prescription</span>
 </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""
+<div class='vcd-section' style='border-left:3px solid #f59e0b'>
+  🏥 <span style='color:#fcd34d;font-size:12px;font-family:monospace'>
+  Health facility missing on this voucher — add it below if you're making an adjustment</span>
+</div>""", unsafe_allow_html=True)
 
         # ── Practitioner + dates ──────────────────────────────────────────────
+        date_missing = not has_real_date
+        date_value_cls = "vcd-value" if has_real_date or date_override else "vcd-value"
+        date_color = "" if (has_real_date) else ("color:#fcd34d" if date_override else "color:#f87171")
         st.markdown(f"""
 <div class='vcd-section'>
   <div class='vcd-row'>
@@ -3201,7 +3250,7 @@ with tab_verify:
   </div>
   <div class='vcd-row'>
     <span class='vcd-label'>📅 Dispensing date</span>
-    <span class='vcd-value'>{dt_str}</span>
+    <span class='{date_value_cls}' style='{date_color}'>{dt_str}</span>
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -3260,6 +3309,38 @@ with tab_verify:
     RWF {_nz(total_cost):,.0f}</span>
 </div>""", unsafe_allow_html=True)
 
+        # ── Add missing data ────────────────────────────────────────────────────
+        if not facility_raw or not has_real_date:
+            with st.expander("📝 Add missing data on this voucher", expanded=False):
+                st.markdown("""
+<div style='font-size:11px;color:#64748b;font-family:monospace;margin-bottom:8px'>
+  This voucher is missing data the original file didn't capture. Fill in what's
+  written on the physical paper — it'll be saved with your adjustment and included
+  in the draft sheet and final report.
+</div>""", unsafe_allow_html=True)
+                mc1, mc2 = st.columns(2)
+                with mc1:
+                    if not facility_raw:
+                        facility_input = st.text_input(
+                            "Health facility", value=facility_override,
+                            placeholder="e.g. Goodlife Ivuriro Ltd - Kicukiro (Clinic)",
+                            key=f"vc_fac_override_{pc}",
+                        )
+                    else:
+                        facility_input = facility_override
+                with mc2:
+                    if not has_real_date:
+                        date_input_val = st.text_input(
+                            "Prescription / dispensing date", value=date_override,
+                            placeholder="e.g. 31/05/2026",
+                            key=f"vc_date_override_{pc}",
+                        )
+                    else:
+                        date_input_val = date_override
+        else:
+            facility_input = facility_override
+            date_input_val = date_override
+
         # ── Verification controls ──────────────────────────────────────────────
         st.markdown('<div class="sec-head">✍️ Verification</div>', unsafe_allow_html=True)
         default_status = existing.get("status", "Ghost Prescription" if pc_display in ghost_vouchers else
@@ -3280,9 +3361,14 @@ with tab_verify:
             placeholder="e.g. Quantity exceeds RSSB limit for amoxicillin",
             key=f"vc_reason_{pc}")
 
-        if status != "Verified" or deduction > 0 or reason.strip():
-            vc_decisions[pc] = {"status": status, "deduction": deduction, "reason": reason,
-                                 "patient": name, "rama": rama, "paper_code": pc_display}
+        if (status != "Verified" or deduction > 0 or reason.strip()
+                or facility_input.strip() or date_input_val.strip()):
+            vc_decisions[pc] = {
+                "status": status, "deduction": deduction, "reason": reason,
+                "patient": name, "rama": rama, "paper_code": pc_display,
+                "facility_override": facility_input.strip(),
+                "date_override": date_input_val.strip(),
+            }
         elif pc in vc_decisions:
             del vc_decisions[pc]
         st.session_state["vc_decisions"] = vc_decisions
@@ -3315,6 +3401,8 @@ with tab_verify:
             "Paper Code": d.get("paper_code", pc), "Patient": d.get("patient", ""), "RAMA": d.get("rama", ""),
             "Status": d.get("status", ""), "Deduction (RWF)": d.get("deduction", 0),
             "Reason": d.get("reason", ""),
+            "Health Facility (added)": d.get("facility_override", ""),
+            "Dispensing Date (added)": d.get("date_override", ""),
         } for pc, d in vc_decisions.items()]
         draft_df = pd.DataFrame(draft_rows).sort_values("Deduction (RWF)", ascending=False)
         draft_df.index = range(1, len(draft_df) + 1)
